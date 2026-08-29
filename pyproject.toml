@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fno-wave-inverse"
+version = "0.1.0"
+description = "FNO surrogate for tone-burst elastic wave scattering, with transferable gradient-based defect localization"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+    "h5py>=3.10",
+    "scipy>=1.11",
+    "matplotlib>=3.8",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "jupyter>=1.0"]
+modal = ["modal>=0.64"]
+
+[tool.setuptools]
+packages = ["src", "src.solver", "src.geometry", "src.models", "src.inverse", "src.data"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: solver validation runs that take minutes on CPU",
+    "gpu: requires CUDA",
+]

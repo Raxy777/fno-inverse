@@ -1,0 +1,36 @@
+{
+ "device": "cpu",
+ "gpu": "",
+ "include_slow": false,
+ "wall_minutes": 1.0468168283333399,
+ "deconvolution": {
+  "worst_amplification": 19.037314412164367,
+  "worst_index": 0,
+  "limit": 25.0
+ },
+ "checks": {
+  "1. energy drift (no absorber)": {
+   "passed": true,
+   "value": 6.467158186751476e-08,
+   "gate": 0.005,
+   "units": "rel",
+   "detail": "nt=410, window t in [5.6, 7.0] T_p, bounded oscillation 0.00%"
+  },
+  "2. P/S arrival error": {
+   "passed": false,
+   "value": 57.49999999999997,
+   "gate": 1.0,
+   "units": "steps",
+   "detail": "27/32 receivers resolve both; P worst 57.50, S worst 7.87 steps (c_s/c_p=0.500)"
+  },
+  "3. absorber residual energy": {
+   "passed": true,
+   "value": 5.947198951616883e-05,
+   "gate": 0.0001,
+   "units": "rel peak",
+   "detail": "30 cells = 0.94 lambda_p, A-scan tail energy 8.54e-04"
+  }
+ },
+ "n_pass": 2,
+ "n_total": 3
+}

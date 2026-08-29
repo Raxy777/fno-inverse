@@ -1,0 +1,15 @@
+# Pinned to match modal_app.py's image and bootstrap.REQUIRED.
+# Install with:  python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
+torch>=2.2
+numpy>=1.26
+h5py>=3.10
+scipy>=1.11
+matplotlib>=3.8
+tqdm>=4.66
+
+# development / validation only
+pytest>=8.0
+jupyter>=1.0
+
+# optional: only needed to launch the headless jobs in modal_app.py
+modal>=0.64
