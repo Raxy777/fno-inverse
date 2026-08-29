@@ -1,2 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
 .venv/
-__pycache__
+venv/
+
+# Data artefacts: datasets, checkpoints, figures, records -- all live on the
+# Modal Volume (or are regenerated), never in git.
+data/
+*.h5
+*.npz
+*.pt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Notebook generator scratch (outside the repo, listed for safety)
+.nbgen/
