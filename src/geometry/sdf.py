@@ -69,6 +69,17 @@ def smooth_min(a: Tensor, b: Tensor, k: float) -> Tensor:
     continuous derivative everywhere, which matters for the two-void family:
     a hard min puts a gradient kink along the locus where the two SDFs cross,
     and L-BFGS handles kinks badly.
+
+    It is a *biased* smoothing, not a symmetric one: at a = b the result is
+    a - k log 2, so the blended surface always sits inside both.  With the
+    default blend of 0.5 cells that is 0.35 cells of systematic inward bias
+    where two voids meet, and up to 0.35 cells of radius inflation on each void
+    even when they are far apart (the far term never vanishes, it only decays
+    like e^{-|a-b|/k}).  Sub-cell, and identical between the geometry channels
+    and the material fields built from them, so it biases the *reported*
+    two-void geometry rather than making the forward model inconsistent.  Report
+    two-void recoveries against the same smooth_min surface, not an idealised
+    union of two hard circles.
     """
     m = torch.minimum(a, b)
     return m - k * torch.log(torch.exp((m - a) / k) + torch.exp((m - b) / k))
@@ -170,11 +181,32 @@ class Ellipse(ShapeFamily):
     """
     theta = (xc, yc, a, b, alpha).  Never trained on -- see §8.5.
 
-    An ellipse has no closed-form signed distance, so we use the first-order
-    normalisation phi ~ g/|grad g| of the implicit function
-    g = (x'/a)^2 + (y'/b)^2 - 1.  This is exact on the boundary (which is the
-    only place the soft indicator has support) and smooth and monotone away from
-    it, which is all the network input needs.
+    An ellipse has no closed-form signed distance, so we use a first-order
+    normalisation phi ~ h/|grad h| of an implicit function h with the same zero
+    set.  Which h you pick matters away from the boundary.  Take
+
+        s(x) = sqrt((x'/a)^2 + (y'/b)^2)     (so s = 1 on the boundary)
+
+    and normalise h = s - 1 rather than g = s^2 - 1:
+
+        grad s = (1/s) * ((x'/a^2), (y'/b^2))   in the rotated frame
+        phi    = (s - 1) * s / sqrt((x'/a^2)^2 + (y'/b^2)^2)
+
+    Both choices are exact *on* the boundary, but only this one is exact
+    everywhere in the circular limit.  Setting a = b = R gives s = r/R and
+    phi = r - R identically, so `Ellipse` reduces to `Circle` exactly rather
+    than approximately.  Normalising g instead returns (r^2 - R^2)/(2r), which
+    is the true distance times (s + 1)/(2s) -- 17% short at r = 1.5 R and
+    growing.  That factor is not a cosmetic error: phi_tilde() feeds the network
+    a clipped SDF channel over +-SDF_CLIP_CELLS, i.e. mostly *away* from the
+    boundary, so under the old form a zero-eccentricity ellipse presented the
+    surrogate with a different input than the circle it is geometrically
+    identical to.  The circles -> mildly eccentric ellipses transfer experiment
+    (§8.5) needs eccentricity to be the only thing that changes; otherwise it
+    measures an input-distribution shift and calls it shape transfer.
+
+    No dataset depends on this: `Circle` is the only family used for training
+    data, and both `Ellipse` and `TwoCircle` are transfer-test-only.
     """
 
     name = "ellipse"
@@ -187,9 +219,9 @@ class Ellipse(ShapeFamily):
         dx_, dy_ = xx - xc, yy - yc
         xp = ca * dx_ + sa * dy_
         yp = -sa * dx_ + ca * dy_
-        g = (xp / a) ** 2 + (yp / b) ** 2 - 1.0
-        grad = 2.0 * torch.sqrt((xp / a ** 2) ** 2 + (yp / b ** 2) ** 2 + 1e-20)
-        return g / (grad + 1e-12)
+        s = torch.sqrt((xp / a) ** 2 + (yp / b) ** 2 + 1e-30)
+        grad = torch.sqrt((xp / a ** 2) ** 2 + (yp / b ** 2) ** 2 + 1e-30)
+        return (s - 1.0) * s / grad
 
     def bounds(self, lambda_s: float) -> tuple[Tensor, Tensor]:
         pad = cfg.BOUNDARY_KEEPOUT_LS * lambda_s
@@ -236,6 +268,52 @@ FAMILIES: dict[str, ShapeFamily] = {
 }
 
 
+def equivalent_circle(theta: Tensor, family: ShapeFamily) -> Tensor:
+    """
+    The area-equivalent circle of any family's theta.  [B, P] -> [B, 3] as (xc, yc, R).
+
+    Centre is the area-weighted centroid of the blobs, R is `sqrt(total area / pi)`.
+    For a circle this is the identity on the first three columns; for an ellipse it is
+    `(xc, yc, sqrt(a b))`; for a two-circle it is the centroid weighted by R1^2, R2^2
+    with `R = sqrt(R1^2 + R2^2)` (overlap ignored, as in `TwoCircle.area`).
+
+    This exists so that a *circle* estimate can be given a position and size error
+    against an *ellipse* or two-void truth -- the direct-regressor baseline of §9.1 and
+    the transfer case of §8.5.  It is a lossy reduction and it is the only honest way to
+    difference parameter vectors of different lengths: blob slots are not in
+    correspondence across families, and a circle has no second axis to compare against.
+    Shape agreement across families is `InversionResult.iou`, which compares each theta
+    through its own SDF and does not reduce anything.  Do not use this to score two
+    members of the *same* family against each other; the family-native metrics are
+    strictly more informative there.
+
+    Two callers had this inline and one of them was subtly different, which is why it
+    lives here: notebook 06's `equivalent_circle` and `cnn_regressor.score`, the latter
+    by way of reading theta[:, :2] and theta[:, 2] literally and thereby scoring an
+    ellipse's semi-major axis as a radius.
+    """
+    t = theta if theta.ndim == 2 else theta.reshape(1, -1)
+    names = family.param_names
+    if "a" in names and "b" in names:
+        ia, ib = names.index("a"), names.index("b")
+        ix, iy = names.index("xc"), names.index("yc")
+        r = (t[:, ia] * t[:, ib]).abs().sqrt()
+        return torch.stack([t[:, ix], t[:, iy], r], dim=-1)
+
+    xs = [i for i, s in enumerate(names) if s.startswith("xc")]
+    ys = [i for i, s in enumerate(names) if s.startswith("yc")]
+    rs = [i for i, s in enumerate(names) if s.startswith("R")]
+    if not (len(xs) == len(ys) == len(rs)) or not xs:
+        raise ValueError(
+            f"family {family.name!r} has parameters {names}, from which an "
+            "area-equivalent circle cannot be read; name the blobs xc/yc/R")
+    a = torch.stack([t[:, i] ** 2 for i in rs], dim=-1)          # ~ area / pi
+    w = a.sum(dim=-1).clamp_min(torch.finfo(t.dtype).tiny)
+    xc = sum(a[:, k] * t[:, xs[k]] for k in range(len(xs))) / w
+    yc = sum(a[:, k] * t[:, ys[k]] for k in range(len(ys))) / w
+    return torch.stack([xc, yc, w.sqrt()], dim=-1)
+
+
 # ---------------------------------------------------------------------------
 # Fields derived from an SDF
 # ---------------------------------------------------------------------------
@@ -278,15 +356,36 @@ def material_fields(chi: Tensor, lam0: float, mu0: float, rho0: float = cfg.RHO0
     """
     (lambda, mu, rho) fields for the solver.
 
-    Stiffness is scaled by (1 - chi) down to a small floor.  Density is scaled by
-    VOID_DENSITY_SCALE, which defaults to 1.0 -- i.e. *unchanged* inside the
-    void.  See README "Documented deviations": §7.2 writes delta_rho = -rho0 chi,
-    but nulling density alongside stiffness makes c = sqrt(stiffness/rho) a 0/0
-    limit whose numerical value can exceed c_p and break the CFL condition.
-    Keeping rho fixed and nulling stiffness gives c_void -> 0, which is
-    unconditionally stable, and an impedance rho*c -> 0, which is the physical
-    content of a traction-free void.  losses.py reads the same constant so the
-    Lippmann-Schwinger residual matches the solver rather than the document.
+    Stiffness is scaled by (1 - chi) down to VOID_STIFFNESS_FLOOR; density is scaled
+    by VOID_DENSITY_SCALE, so the void interior is soft *and* light.  §7.2 writes
+    delta_rho = -rho0 chi, i.e. a void with no mass at all, and this is the nearest
+    numerically stable thing to it.
+
+    Both floors matter, and the reason the density one exists is not the reason v2.0
+    gave.  It used to say that nulling density makes c = sqrt(stiffness/rho) a 0/0
+    limit that can exceed c_p; that is wrong -- when both floors are hit at the same
+    chi the cell-centred speed is sqrt(1e-4/1e-2) = 0.1 c_p, and it is bounded by c_p
+    for every chi in between.  The real constraint is that the solver does not
+    evaluate either field at a cell centre alone: `rho_vy = avg_plus(rho, -2)`
+    averages neighbouring densities arithmetically, and the 4th-order stress stencil
+    reaches two cells, so a face just inside a *sharp* void combines a small density
+    with stiffness from full-strength material two cells away.  At
+    VOID_DENSITY_SCALE = 1e-4 and a sub-cell interface that diverges (measured: step
+    200 of 1408).  At 1e-2, with the interface width of EPS_INTERFACE_PHYS spreading
+    both fields over the same two cells, it is stable and the residual impedance is
+    sqrt(VOID_STIFFNESS_FLOOR * VOID_DENSITY_SCALE) = 1e-3 of the host.
+
+    Retaining the *full* density -- v2.0's default -- is not a small deviation.  The
+    void interior becomes a bag of nearly free masses whose first layer rides on the
+    interface as an added mass, loading it by k_s dx = 0.43 at f_max.  Measured on the
+    receiver ring against the analytic cavity, at the present interface width: 76.7%
+    relative error with rho retained, 9.3% without, and the fitted amplitude ratio drops
+    to 0.71, so it is not a slightly wrong cavity but a different scatterer
+    (`solver/validate.py:check_cavity_scattering`).
+
+    losses.py reads the same two constants, so delta_rho and delta_C in the
+    differential scattered-field residual describe the medium the solver actually
+    stepped rather than the one the document specifies.
     """
     solid = (1.0 - chi).clamp_min(cfg.VOID_STIFFNESS_FLOOR)
     lam = lam0 * solid

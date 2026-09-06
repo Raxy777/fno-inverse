@@ -131,7 +131,7 @@ class RingCNN(nn.Module):
     def predict_theta(self, x: Tensor, nu: Tensor,
                       family: ShapeFamily | None = None) -> Tensor:
         """
-        [B, C, R] -> theta [B, 3] physical.
+        [B, C, R] -> theta [B, n_out] physical, in `family`'s parameterisation.
 
         lambda_s depends on nu, so the bounds do too, and the mapping is done per
         distinct nu rather than with a single box.  Using one nu's box for all of
@@ -139,6 +139,9 @@ class RingCNN(nn.Module):
         (lambda_s(0.25)/lambda_s(0.37) - 1) ~ 13% into the estimate.
         """
         family = family or Circle()
+        assert self.n_out == len(family.param_names), (
+            f"head emits {self.n_out} numbers, {family.name!r} takes "
+            f"{len(family.param_names)}; retrain with n_out=")
         z = self(x)
         out = torch.empty_like(z)
         for v in torch.unique(nu):
@@ -154,7 +157,7 @@ class RingCNN(nn.Module):
 @dataclass
 class RingData:
     x: Tensor          # [N, C, R] float32, ready for the network
-    theta: Tensor      # [N, 3] physical truth
+    theta: Tensor      # [N, P] physical truth, P set by the *truth's* family
     nu: Tensor         # [N]
     src_idx: Tensor    # [N]
 
@@ -166,8 +169,18 @@ class RingData:
                         self.nu.to(device), self.src_idx.to(device))
 
     def z(self, family: ShapeFamily | None = None) -> Tensor:
-        """Targets in unconstrained coordinates, per-sample lambda_s."""
+        """
+        Targets in unconstrained coordinates, per-sample lambda_s.
+
+        Training only, and therefore circle-only in practice.  The assertion is here
+        because `theta` may hold an ellipse or two-void truth for the transfer
+        experiment, and `to_unconstrained` would happily read the first three columns of
+        one and return silently wrong targets.
+        """
         family = family or Circle()
+        assert self.theta.shape[1] == len(family.param_names), (
+            f"theta has {self.theta.shape[1]} parameters, {family.name!r} takes "
+            f"{len(family.param_names)}")
         out = torch.empty_like(self.theta)
         for v in torch.unique(self.nu):
             m = self.nu == v
@@ -281,28 +294,49 @@ def train_regressor(train: RingData, val: RingData, *, device=None,
 
 
 @torch.no_grad()
-def score(net: RingCNN, data: RingData, *, family: ShapeFamily | None = None
-          ) -> dict:
+def score(net: RingCNN, data: RingData, *, family: ShapeFamily | None = None,
+          truth_family: ShapeFamily | None = None) -> dict:
     """
-    Position and radius error in shear wavelengths, and the §11.2 step 11 gate.
+    The baseline's scores, computed by the code that scores the pipeline.
 
-    Errors are reported in lambda_s rather than in absolute units because lambda_s
-    varies by 13% across the four Poisson ratios, and the gate (position error
-    < lambda_s/10) is stated in wavelengths.
+    Returns exactly `inverse.invert.summarise`'s dictionary, because it *is* that
+    function: one `InversionResult` is built per sample and the list handed over.  The
+    notebooks print the baseline's column beside the inversion's column in one table,
+    and until now those two columns were two different definitions of "position error"
+    -- this one differenced `theta[:, :2]` and `theta[:, 2]` literally, while the
+    pipeline's matched blobs permutation-invariantly, reduced an ellipse to its
+    equal-area radius and required IoU as well as position.  Comparing them was
+    comparing measurements, not estimators, which is the specific failure §9 asks to be
+    removed from the comparison.  It also means the baseline now gets an IoU, a p90 and
+    a two-gate success rate for free.
+
+    Errors are in lambda_s rather than absolute units because lambda_s varies by 13%
+    across the four Poisson ratios and the gate (position error < lambda_s/10) is stated
+    in wavelengths.
+
+    `truth_family` is for the transfer experiment: `data.theta` then holds *that*
+    family's parameters (5 columns for an ellipse, 6 for two voids) while the network
+    still predicts a circle, and the reduction to comparable numbers happens inside
+    `InversionResult` where it is documented, rather than in a notebook cell.  Callers
+    previously pre-reduced the truth to an equal-area circle themselves; passing the
+    real truth instead is what makes the IoU column meaningful.
     """
+    from ..inverse.invert import InversionResult, summarise   # local: models <- inverse
+
     family = family or Circle()
     net.eval()
     theta = net.predict_theta(data.x, data.nu, family)
-    lam_s = torch.tensor([cfg.cs_over_cp(float(v)) / cfg.FC for v in data.nu],
-                         device=theta.device)
-    pos = ((theta[:, :2] - data.theta[:, :2]).pow(2).sum(-1).sqrt() / lam_s)
-    rad = ((theta[:, 2] - data.theta[:, 2]).abs() / lam_s)
-    ok = pos < cfg.GATE_POSITION_LS
-    return dict(position_ls_mean=float(pos.mean()),
-                position_ls_median=float(pos.median()),
-                radius_ls_mean=float(rad.mean()),
-                success_rate=float(ok.float().mean()),
-                gate_pass=bool(ok.float().mean() >= cfg.GATE_SUCCESS_RATE))
+    exp = len((truth_family or family).param_names)
+    assert data.theta.shape[1] == exp, (
+        f"truth has {data.theta.shape[1]} parameters but "
+        f"{(truth_family or family).name!r} takes {exp}; pass truth_family=")
+    results = [
+        InversionResult(theta=theta[i], misfit=float("nan"),
+                        theta_true=data.theta[i],
+                        lambda_s=cfg.cs_over_cp(float(data.nu[i])) / cfg.FC,
+                        n_forward=1, family=family, truth_family=truth_family)
+        for i in range(len(data))]
+    return summarise(results)
 
 
 def save(net: RingCNN, path) -> None:

@@ -2,9 +2,14 @@
 Batched 4th-order staggered-grid velocity-stress elastic FDTD (§3.1 - §3.6).
 
 Written in PyTorch so that many samples run in parallel on one GPU, and so the
-same finite-difference kernels can be reused by the Lippmann-Schwinger physics
-loss (§7.2) -- consistency between the label-generation path and the physics-loss
-path is worth more than elegance in either one.
+same finite-difference kernels can be reused by the differential scattered-field
+physics loss (§7.2) -- consistency between the label-generation path and the
+physics-loss path is worth more than elegance in either one.  ("Lippmann-Schwinger"
+is what earlier versions of this file and of §7.2 called that residual; it is not.
+Lippmann-Schwinger is the *integral* equation, u = u_inc + G * V u, and nothing here
+builds a Green's operator.  What §7.2 writes is the differential equation the
+scattered field satisfies, with the contrast terms as a source, and what
+`losses.physics_loss` evaluates is its residual under this stencil.)
 
 Grid convention
 ---------------
@@ -139,29 +144,41 @@ def source_spectrum(omegas: Tensor, dt: float, nt: int, *,
                     fc: float = cfg.FC, n_cycles: int = cfg.N_CYCLES,
                     dtype=torch.float64) -> Tensor:
     """
-    s_hat(omega) using *exactly* the quadrature the solver's running DFT uses.
+    s_hat(omega) on the grid the force is *injected* on: t_n = n dt.
 
-    This function and `dft_at_freqs` must agree term for term, or the
-    deconvolution u_hat = v_hat / (i omega s_hat) picks up a spurious
-    frequency-dependent phase that would look exactly like a wave-speed error.
-    tests/test_dft_consistency.py asserts they do.
+    Not the velocity grid.  The force enters the leapfrog velocity update, which
+    steps v^{n-1/2} -> v^{n+1/2} about the stress level t^n, so the body force in
+    that update is the force at t^n and the DFT that inverts it must use integer
+    sample times.  Deconvolving a velocity phasor (half-integer times) with a
+    source spectrum computed on the same half-integer grid leaves a factor
+    exp(+i omega dt/2) on every phasor: 0.072 rad at f_max, a 6% error that looks
+    exactly like every wave arriving half a step early -- indistinguishable from a
+    uniform wave-speed error, which is the quantity the inversion measures.
+
+    `tests/test_dft_consistency.py` pins this against the injection site, and
+    `solver.validate.check_green_incident` measures the consequence against the
+    analytic Green's tensor.
     """
-    t = (torch.arange(nt, dtype=dtype, device=omegas.device) + 0.5) * dt
+    t = torch.arange(nt, dtype=dtype, device=omegas.device) * dt
     s = tone_burst(t, fc, n_cycles)
-    return dft_at_freqs(s.unsqueeze(0), omegas.to(dtype), dt, nt).squeeze(0)
+    return dft_at_freqs(s.unsqueeze(0), omegas.to(dtype), dt, nt,
+                        t_offset=0.0).squeeze(0)
 
 
-def dft_at_freqs(signal: Tensor, omegas: Tensor, dt: float, nt: int) -> Tensor:
+def dft_at_freqs(signal: Tensor, omegas: Tensor, dt: float, nt: int, *,
+                 t_offset: float = 0.5) -> Tensor:
     """
-    Midpoint-rule DFT of a signal sampled at t_n = (n + 1/2) dt.
+    DFT of a signal sampled at t_n = (n + `t_offset`) dt:
 
-        X(omega) = sum_n x_n exp(-i omega (n + 1/2) dt) dt
+        X(omega) = sum_n x_n exp(-i omega (n + t_offset) dt) dt
 
-    `signal` is [..., nt]; returns [..., n_omega] complex.  The midpoint sample
-    times are not cosmetic: the leapfrog puts velocities at half-integer time
-    levels, so this is the grid the data actually lives on.
+    `signal` is [..., nt]; returns [..., n_omega] complex.  The default 1/2 is the
+    velocity grid, because the leapfrog puts velocities at half-integer time
+    levels and that is the grid the recorded data actually lives on.  Pass 0.0 for
+    a quantity defined at integer levels -- the stresses, or the injected source.
     """
-    t = (torch.arange(nt, dtype=torch.float64, device=signal.device) + 0.5) * dt
+    t = ((torch.arange(nt, dtype=torch.float64, device=signal.device) + t_offset)
+         * dt)
     phase = torch.exp(-1j * omegas.to(torch.float64).view(-1, 1) * t.view(1, -1))
     x = signal.to(torch.complex128)
     return torch.einsum("...t,mt->...m", x, phase) * dt
@@ -170,14 +187,14 @@ def dft_at_freqs(signal: Tensor, omegas: Tensor, dt: float, nt: int) -> Tensor:
 # ---------------------------------------------------------------------------
 # Absorbing layer
 # ---------------------------------------------------------------------------
-def damping_profile(n_total: int, n_pml: int, dx: float, *,
-                    shift_y: float = 0.0, shift_x: float = 0.0,
-                    order: float = cfg.PML_ORDER,
-                    r_target: float = cfg.PML_R_TARGET,
-                    c: float = cfg.CP,
-                    device=None, dtype=torch.float32) -> Tensor:
+def absorber_profile(n_total: int, n_pml: int, dx: float, *,
+                     shift_y: float = 0.0, shift_x: float = 0.0,
+                     order: float = cfg.ABSORBER_ORDER,
+                     r_target: float = cfg.ABSORBER_R_TARGET,
+                     c: float = cfg.CP,
+                     device=None, dtype=torch.float32) -> Tensor:
     """
-    Graded polynomial damping d(x) = d0 (depth / L_pml)^p, summed over the two
+    Graded polynomial damping d(x) = d0 (depth / L_abs)^p, summed over the two
     directions (§3.6).
 
     Graded rather than constant because an abrupt jump in damping is itself an
@@ -186,6 +203,11 @@ def damping_profile(n_total: int, n_pml: int, dx: float, *,
 
     `shift_y/shift_x` evaluate the profile at a staggered location (pass 0.5 for
     a half-cell offset) so each field is damped at its own position.
+
+    This is a sponge, not a PML: the damping is added to the velocity update
+    without any complex coordinate stretch, so `r_target` is a design input to the
+    d0 formula and not the reflection the layer achieves.  `solver.validate.
+    check_absorber_reflection` measures the achieved reflection.
     """
     if n_pml <= 0:
         return torch.zeros(n_total, n_total, device=device, dtype=dtype)
@@ -202,6 +224,9 @@ def damping_profile(n_total: int, n_pml: int, dx: float, *,
     dy = axis_profile(shift_y).view(-1, 1)
     dx_ = axis_profile(shift_x).view(1, -1)
     return dy + dx_
+
+
+damping_profile = absorber_profile      # earlier name, kept for callers/notebooks
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +267,9 @@ class ElasticFDTD2D:
     def __init__(self, lam: Tensor, mu: Tensor, rho: Tensor, *,
                  dx: float = cfg.DX_FINE, dt: float = cfg.DT,
                  n_pml: int = cfg.N_PML_FINE,
-                 downsample: int = cfg.DOWNSAMPLE):
+                 downsample: int = cfg.DOWNSAMPLE,
+                 absorber_order: float = cfg.ABSORBER_ORDER,
+                 absorber_r_target: float = cfg.ABSORBER_R_TARGET):
         assert lam.shape == mu.shape == rho.shape and lam.dim() == 3
         self.B, self.ny, self.nx = lam.shape
         assert self.ny == self.nx, "square grids only"
@@ -284,11 +311,18 @@ class ElasticFDTD2D:
         self.rho_vy = avg_plus(rho, -2)                 # y-faces
 
         # -- damping, one profile per field position -----------------------
-        kw = dict(device=self.device, dtype=self.dtype)
-        self.d_c = damping_profile(self.ny, n_pml, dx, **kw)
-        self.d_vx = damping_profile(self.ny, n_pml, dx, shift_x=0.5, **kw)
-        self.d_vy = damping_profile(self.ny, n_pml, dx, shift_y=0.5, **kw)
-        self.d_xy = damping_profile(self.ny, n_pml, dx, shift_x=0.5, shift_y=0.5, **kw)
+        # `absorber_order` and `absorber_r_target` are arguments rather than reads of
+        # the config so that `solver.validate.check_absorber_reflection` can measure
+        # what the layer actually reflects as a function of its own design inputs.  The
+        # production values are the config defaults.
+        self.absorber_order = absorber_order
+        self.absorber_r_target = absorber_r_target
+        kw = dict(device=self.device, dtype=self.dtype, order=absorber_order,
+                  r_target=absorber_r_target)
+        self.d_c = absorber_profile(self.ny, n_pml, dx, **kw)
+        self.d_vx = absorber_profile(self.ny, n_pml, dx, shift_x=0.5, **kw)
+        self.d_vy = absorber_profile(self.ny, n_pml, dx, shift_y=0.5, **kw)
+        self.d_xy = absorber_profile(self.ny, n_pml, dx, shift_x=0.5, shift_y=0.5, **kw)
 
         # Crank-Nicolson factors for  dF/dt + d F = RHS  (§3.6)
         def cn(d: Tensor) -> tuple[Tensor, Tensor]:
@@ -404,9 +438,16 @@ class ElasticFDTD2D:
                                  device=dev, dtype=self.dtype)
 
         e_list, e_t = [], []
-        # Source samples at the velocity time levels t = (n + 1/2) dt.
+        # Source samples at the *stress* time levels t = n dt, not the velocity
+        # levels: the force is added to the velocity update that steps
+        # v^{n-1/2} -> v^{n+1/2}, and that update is centred on t^n.  Sampling the
+        # burst at (n+1/2) dt instead is a half-step time shift of the effective
+        # source -- first order, and worth 6% of the phasor at f_max.
+        # `source_spectrum` uses this same grid so the deconvolution inverts what
+        # was actually injected.
+        ts = torch.arange(nt, device=dev, dtype=torch.float64) * dt
         tv = (torch.arange(nt, device=dev, dtype=torch.float64) + 0.5) * dt
-        src_wave = tone_burst(tv, cfg.FC, n_cycles).to(self.dtype) * amplitude
+        src_wave = tone_burst(ts, cfg.FC, n_cycles).to(self.dtype) * amplitude
         # point force -> body-force density
         src_scale = 1.0 / dx ** 2
 
@@ -497,7 +538,9 @@ class ElasticFDTD2D:
             meta=dict(nt=nt, dt=dt, dx=dx, courant=self.courant,
                       n_pml=self.n_pml, grid=nx, n_cycles=n_cycles,
                       n_net=self.n_net, downsample=self.downsample,
-                      dft_every=dft_every),
+                      dft_every=dft_every, absorber_kind=cfg.ABSORBER_KIND,
+                      absorber_order=self.absorber_order,
+                      absorber_r_target=self.absorber_r_target),
         )
 
 

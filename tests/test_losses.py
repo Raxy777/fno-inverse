@@ -4,7 +4,8 @@ The training objective (§7), and in particular the physics residual.
 Four tests here are load-bearing; the rest are plumbing.
 
 `test_navier_residual_vanishes_on_analytic_plane_waves` is the one that matters most.
-The Lippmann-Schwinger residual is the only term in the loss whose *correctness* is not
+The differential scattered-field residual of §7.2 is the only term in the loss whose
+*correctness* is not
 checked by training converging -- a residual with a sign error, a transposed axis, or a
 missing cross term still has a minimum, the network still descends it, and the result is
 a network that has learned to satisfy the wrong equation.  So the residual is confronted
@@ -134,20 +135,48 @@ def test_d1_reproduces_the_fourth_order_symbol_exactly():
 
 
 def test_d1_error_falls_by_sixteen_when_the_wave_is_resolved_twice_as_well():
+    """
+    Halving theta divides the error by 15.77, not 16, and the shortfall is predictable.
+
+    16 is the leading-order statement (1 - ratio = theta^4/30 + O(theta^6)).  The exact
+    symbol gives (1 - ratio(0.4)) / (1 - ratio(0.2)) = 15.773, and the measured ratio
+    matches that to five figures -- so this test pins the theta^6 term rather than
+    tolerating it.  Quoting a clean 16 at theta = 0.4 would be asserting an asymptotic
+    rate outside the asymptotic regime, the same conflation
+    `test_navier_residual_is_fourth_order_in_the_grid_spacing` documents.
+
+    The raw max error also carries a grid-phase factor: cos(kx) is sampled at different
+    phases for the two k, so max |sin(kx)| over the grid is 0.99979 and 0.99999
+    respectively rather than 1.  Dividing it out isolates the stencil symbol, and then
+    the error is |1 - ratio(theta)| to six figures.
+    """
     n, dx = 64, 0.05
 
-    def normalised_max_error(theta: float) -> float:
+    def normalised_max_error(theta: float) -> tuple[float, float]:
         k = theta / dx
         x = torch.arange(n, dtype=torch.float64) * dx
         got = losses.d1(torch.cos(k * x), -1, dx)
-        want = -k * torch.sin(k * x)[2:-2]
-        return (got - want).abs().max().item() / k
+        sin_k = torch.sin(k * x)[2:-2]
+        want = -k * sin_k
+        raw = (got - want).abs().max().item() / k
+        return raw, raw / sin_k.abs().max().item()
 
-    e1 = normalised_max_error(0.4)
-    e2 = normalised_max_error(0.2)
-    assert e1 / e2 == pytest.approx(16.0, rel=0.01)
-    # theta^4 / 30, times the largest |sin| the grid happens to sample.
-    assert e1 == pytest.approx(0.4 ** 4 / 30.0, rel=0.01)
+    raw1, e1 = normalised_max_error(0.4)
+    raw2, e2 = normalised_max_error(0.2)
+    exact = (1.0 - _stencil_ratio(0.4)) / (1.0 - _stencil_ratio(0.2))
+
+    assert exact == pytest.approx(15.773, abs=1e-3)
+    assert e1 / e2 == pytest.approx(exact, rel=1e-4)
+    assert e1 == pytest.approx(1.0 - _stencil_ratio(0.4), rel=1e-6)
+    assert e2 == pytest.approx(1.0 - _stencil_ratio(0.2), rel=1e-6)
+    # the phase factor is real but small, so the raw ratio is close to the exact one
+    assert raw1 / raw2 == pytest.approx(exact, rel=2e-3)
+    assert 15.0 < raw1 / raw2 < 16.0
+    # theta^4 / 30 is the leading term only: at theta = 0.4 it overstates the error by
+    # 1.9%, which is the same theta^6 term the ratio above is short by.
+    assert e1 == pytest.approx(0.4 ** 4 / 30.0, rel=0.02)
+    assert e1 < 0.4 ** 4 / 30.0
+    assert e2 == pytest.approx(0.2 ** 4 / 30.0, rel=0.005)
 
 
 def test_d1_shrinks_only_the_differentiated_axis():
@@ -200,6 +229,11 @@ def test_navier_residual_vanishes_on_analytic_plane_waves(mode, direction):
     of diagonal wavefronts.  With alpha ~ 0.1 and a 2% floor it is far below the data
     term's influence, which is the argument for tolerating it rather than switching to
     a rotationally-invariant stencil.
+
+    "Four times smaller" is the theta^4 statement; the exact symbol gives 3.839, since
+    theta = 0.785 axial is not in the asymptotic regime.  The literals below are the
+    exact values -- the diagonal one used to read 0.006133, which is neither the
+    theta^4 estimate (0.005858) nor the truth (0.0061037).
     """
     nu, ppw, n, dx = 0.33, 8.0, 40, 0.1
     k = 2.0 * math.pi / (ppw * dx)
@@ -227,9 +261,12 @@ def test_navier_residual_vanishes_on_analytic_plane_waves(mode, direction):
     assert float(losses.physics_loss(u, ctx)) == pytest.approx(expected, rel=1e-6)
     assert expected < 0.05
     if direction == "axial":
-        assert expected == pytest.approx(0.023431, abs=2e-5)
+        assert expected == pytest.approx(0.0234308, abs=2e-6)
     else:
-        assert expected == pytest.approx(0.006133, abs=2e-5)
+        assert expected == pytest.approx(0.0061037, abs=2e-6)
+        axial = abs(1.0 - _stencil_ratio(k * dx) ** 2)
+        assert axial / expected == pytest.approx(3.839, abs=2e-3), (
+            "the axial/diagonal ratio is 3.839, not the theta^4 estimate of 4")
 
 
 def test_navier_residual_is_fourth_order_in_the_grid_spacing():
@@ -270,18 +307,56 @@ def test_navier_residual_shape_and_dtype():
     assert r.is_complex()
 
 
+def _expanded_navier(u: torch.Tensor, ctx: losses.PhysicsContext) -> torch.Tensor:
+    """
+    (lam + mu) grad div u + mu lap u + rho omega^2 u, built from the *same* stencils.
+
+    The textbook constant-coefficient form, i.e. what `navier_residual` would be if
+    someone "simplified" it.  Using losses.d1 twice, exactly as navier_residual does,
+    means the two agree bitwise up to float64 rounding whenever lam and mu are
+    constant -- so any difference between them is the grad-lam / grad-mu physics and
+    not a discretisation artefact.
+    """
+    dx = ctx.dx
+    ux, uy = u[:, 0:1], u[:, 1:2]
+    dux_dx = losses.d1(ux, -1, dx)[..., 2:-2, :]
+    dux_dy = losses.d1(ux, -2, dx)[..., :, 2:-2]
+    duy_dx = losses.d1(uy, -1, dx)[..., 2:-2, :]
+    duy_dy = losses.d1(uy, -2, dx)[..., :, 2:-2]
+    div = dux_dx + duy_dy
+
+    lam, mu = ctx.lam[..., 4:-4, 4:-4], ctx.mu[..., 4:-4, 4:-4]
+    grad_div = [losses.d1(div, -1, dx)[..., 2:-2, :],
+                losses.d1(div, -2, dx)[..., :, 2:-2]]
+    lap = [losses.d1(dux_dx, -1, dx)[..., 2:-2, :]
+           + losses.d1(dux_dy, -2, dx)[..., :, 2:-2],
+           losses.d1(duy_dx, -1, dx)[..., 2:-2, :]
+           + losses.d1(duy_dy, -2, dx)[..., :, 2:-2]]
+    rho = ctx.rho[..., 4:-4, 4:-4]
+    ui = u[..., 4:-4, 4:-4]
+    return torch.cat([(lam + mu) * grad_div[i] + mu * lap[i]
+                      + rho * ctx.omega ** 2 * ui[:, i:i + 1] for i in (0, 1)], dim=1)
+
+
 def test_navier_residual_uses_the_variable_coefficient_form():
     """
-    With a spatially varying mu the stress-divergence form and the expanded
-    Navier-Cauchy form disagree, and the residual must follow the former.
+    `navier_residual` is d_j sigma_ij, not the expanded (lam + mu) grad div + mu lap.
 
-    The expanded form (lam + mu) grad div u + mu lap u drops the grad-mu terms.  So
-    perturbing mu in a smooth patch, on a field that is an exact solution of the
-    *constant* coefficient problem, must change the residual by an amount that
-    involves the gradient of the perturbation -- in particular, a perturbation with
-    zero mean but a nonzero gradient must still change the residual.  This is the
-    test that would fail if someone "simplified" the residual back to the textbook
-    Laplacian form, which is exactly the simplification the void makes illegal.
+    The two differ by (d_i lam)(div u) + (d_j mu)(d_i u_j + d_j u_i), so they are the
+    same operator only for constant coefficients -- and a void is the opposite of
+    constant.  This is the test that fails if someone "simplifies" the residual back to
+    the textbook Laplacian form.
+
+    It compares the two forms *directly*, which the previous version did not: it
+    perturbed mu and asserted the residual grew more than fivefold over the plane-wave
+    baseline.  That assertion was not discriminating and was also false.  Not
+    discriminating, because the expanded form would also change when mu changes -- mu
+    multiplies lap u pointwise -- so growth does not identify which operator is
+    implemented.  False, because the baseline it multiplied is the 2.3% *dispersion*
+    floor of the axial P wave, while the grad-mu term for a 10% ramp is 0.2 mu / (rho
+    cp^2 k dx) ~ 6e-3 of the inertial term; asking a 0.6% effect to beat 5 x 2.3% is
+    asking the wrong question of the right code.  Growth to 2.2x is what a correct
+    implementation gives, and that number is pinned below.
     """
     n, dx, nu = 40, 0.1, 0.33
     k = 2.0 * math.pi / (8.0 * dx)
@@ -289,11 +364,56 @@ def test_navier_residual_uses_the_variable_coefficient_form():
     ctx = _homogeneous_ctx(n, dx, nu, cfg.CP * k)
     base = _relative_residual(u, ctx)
 
+    # 1. Constant coefficients: the two forms are the same discrete operator.
+    r_div = losses.navier_residual(u, ctx)
+    r_exp = _expanded_navier(u, ctx)
+    scale = (ctx.rho[..., 4:-4, 4:-4] * ctx.omega ** 2
+             * u[..., 4:-4, 4:-4]).abs().pow(2).sum().sqrt()
+    assert float((r_div - r_exp).abs().max()) < 1e-12 * float(scale), (
+        "with constant lam and mu the stress-divergence and expanded forms must agree "
+        "to rounding; if they do not, the crop bookkeeping differs between them and "
+        "the comparison below proves nothing")
+
+    # 2. A zero-mean ramp in mu: now they must differ, by the grad-mu term exactly.
     _, xx = _coords(n, dx)
     ramp = 0.1 * (xx - xx.mean())                       # zero mean, constant gradient
     ctx.mu = ctx.mu * (1.0 + ramp)
     assert float(ctx.mu.mean()) == pytest.approx(cfg.lame_from_nu(nu)[1], rel=1e-12)
-    assert _relative_residual(u, ctx) > 5.0 * base
+
+    r_div = losses.navier_residual(u, ctx)
+    r_exp = _expanded_navier(u, ctx)
+    diff = (r_div - r_exp).abs().pow(2).sum().sqrt()
+    assert float(diff) > 1e-3 * float(scale), (
+        "a spatially varying mu must make the two forms disagree; they did not, so the "
+        "residual has been reduced to the constant-coefficient form")
+
+    # The disagreement is (d_x mu)(d_i u_x + d_x u_i) -- times the discrete product-rule
+    # symbol, because d1(mu g) != mu d1(g) + d1(mu) g for a 4-point stencil.  For a
+    # linear mu the exact identity is d1(mu g)_i = mu_i d1(g)_i + (dmu/dx) S(theta) g_i
+    # with S(theta) = (4/3) cos theta - (1/3) cos 2theta, the symbol of sum_m m c_m
+    # e^{i m theta}.  S -> 1 as theta -> 0; at 8 points per wavelength it is 0.9428, so
+    # the grad-mu term the loss actually sees is 5.7% weaker than the continuum one.
+    # That is a property of the discretisation, and pinning it is the point: the review
+    # asks whether the physics loss and the solver discretise the same operator, and
+    # this is the coefficient at which the question can be asked.
+    theta = k * dx
+    prod_symbol = (4.0 / 3.0) * math.cos(theta) - (1.0 / 3.0) * math.cos(2.0 * theta)
+    assert prod_symbol == pytest.approx(0.9428090, abs=1e-6)
+    dmu_dx = losses.d1(ctx.mu, -1, dx)[..., 2:-2, :][..., 2:-2, 2:-2]
+    dux_dx = losses.d1(u[:, 0:1], -1, dx)[..., 2:-2, :][..., 2:-2, 2:-2]
+    dux_dy = losses.d1(u[:, 0:1], -2, dx)[..., :, 2:-2][..., 2:-2, 2:-2]
+    duy_dx = losses.d1(u[:, 1:2], -1, dx)[..., 2:-2, :][..., 2:-2, 2:-2]
+    want = prod_symbol * torch.cat(
+        [dmu_dx * 2.0 * dux_dx, dmu_dx * (dux_dy + duy_dx)], dim=1)
+    assert float((r_div - r_exp - want).abs().max()) < 1e-12 * float(
+        want.abs().max()) + 1e-13, (
+        "the difference between the forms is not the discrete grad-mu term")
+
+    # And the size of the effect, so a regression that halves it is visible.
+    grown = _relative_residual(u, ctx)
+    assert grown / base == pytest.approx(2.209, rel=0.01)
+    assert float(diff) / float(scale) == pytest.approx(6.1e-3, rel=0.05), (
+        "0.2 mu S(theta) / (rho cp^2 k dx) for nu = 0.33 at 8 points per wavelength")
 
 
 # ---------------------------------------------------------------------------
@@ -609,8 +729,17 @@ def test_measurement_loss_only_reads_the_receiver_ring():
 
 
 def test_measurement_loss_subset_is_reproducible_and_in_range():
-    n = 16
+    """
+    The subset draw is seed-determined, duplicate-free and clamped to the ring size.
+
+    The grid is 32 wide because the ring below reaches x = 23: this test used to build
+    a 12-receiver ring with x up to 23 on a 16x16 field, which is not a ring on that
+    grid at all.  `measurement_loss` now rejects that instead of indexing off the end,
+    which is what turned the mismatch from an inscrutable IndexError into a statement.
+    """
+    n = 32
     recv = torch.tensor([[i + 1, 2 * i + 1] for i in range(12)])
+    assert int(recv.max()) < n
     t = torch.randn(3, 4, n, n)
     p = t + 0.1
 
@@ -630,6 +759,12 @@ def test_measurement_loss_subset_is_reproducible_and_in_range():
     _, sel_all = run(5, n_subset=99)
     assert sel_all.shape == (12,)
     assert float(losses.measurement_loss(t, t, recv)[0]) == 0.0
+
+    # A ring from the wrong grid is an error with a message, not silent wrapping.
+    with pytest.raises(IndexError, match="different grids"):
+        losses.measurement_loss(t[..., :16, :16], t[..., :16, :16], recv)
+    with pytest.raises(IndexError, match="different grids"):
+        losses.measurement_loss(p, t, torch.tensor([[0, 0], [-1, 3]]))
 
 
 # ---------------------------------------------------------------------------

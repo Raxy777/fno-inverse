@@ -43,7 +43,7 @@ import torch
 import torch.nn as nn
 
 from src import config as cfg
-from src.geometry.sdf import Circle
+from src.geometry.sdf import FAMILIES, Circle
 from src.models.cnn_regressor import RING_CHANNELS, RingCNN, pack_ring
 from src.models.fno2d import (FNO2d, FourierBlock, SpectralConv2d, band_in_modes,
                               build, to_double)
@@ -576,3 +576,42 @@ def test_ring_cnn_predict_theta_lands_in_the_per_nu_box():
     lo25, hi25 = fam.bounds(cfg.cs_over_cp(0.25) / cfg.FC)
     lo37, hi37 = fam.bounds(cfg.cs_over_cp(0.37) / cfg.FC)
     assert hi25[2] > hi37[2], "a faster shear wave means a larger maximal radius"
+
+
+def test_baseline_and_pipeline_are_scored_by_one_function():
+    """
+    The notebooks print the regressor's error beside the inversion's in one table, so the
+    two have to be the same measurement.  `score` therefore builds an `InversionResult`
+    per sample and returns `invert.summarise`'s dictionary verbatim -- it used to compute
+    its own mean of `theta[:, :2]` differences, which is neither permutation-invariant
+    nor gated on shape, and comparing those two columns compared definitions rather than
+    estimators (§9).
+    """
+    from src.inverse.invert import summarise
+    from src.models.cnn_regressor import RingData, score
+
+    net = RingCNN(c_in=RING_CHANNELS, width=16, depth=2).eval()
+    n = 6
+    data = RingData(x=torch.randn(n, RING_CHANNELS, cfg.N_RECV),
+                    theta=torch.stack([torch.tensor([4.0, 4.0, 0.3])] * n),
+                    nu=torch.full((n,), 1 / 3), src_idx=torch.zeros(n, dtype=torch.long))
+    out = score(net, data)
+    ref = summarise([])
+    assert set(out) >= set(ref) - {"axis_ratio_error_median",
+                                   "orientation_error_deg_median"}
+    assert out["n"] == n
+    for k in ("iou_median", "position_ls_p90", "success_rate_position_only"):
+        assert k in out, f"{k} came for free with the shared scorer"
+
+    # An out-of-family truth needs saying so, not silent column truncation.
+    ell = RingData(x=data.x, theta=torch.stack([torch.tensor([4.0, 4.0, .4, .2, .3])] * n),
+                   nu=data.nu, src_idx=data.src_idx)
+    with pytest.raises(AssertionError, match="pass truth_family"):
+        score(net, ell)
+    out_e = score(net, ell, truth_family=FAMILIES["ellipse"])
+    assert out_e["n"] == n and 0.0 <= out_e["iou_median"] <= 1.0
+
+    # And the training targets refuse a 5-column truth for a 3-parameter family, which
+    # `to_unconstrained` would otherwise read the first three columns of.
+    with pytest.raises(AssertionError, match="circle"):
+        ell.z()

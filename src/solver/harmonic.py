@@ -5,15 +5,33 @@ The solver runs a tone burst; the network learns a *time-harmonic* operator.  Th
 file is the bridge, and it is deliberately small, because the bridge is where the
 subtle errors live.  Three of them, named so they can be checked:
 
-1. **Quadrature mismatch.**  The phasors come out of a running DFT inside the time
-   loop (`fdtd_elastic.dft_at_freqs`, midpoint rule at t = (n+1/2)dt).  The source
-   spectrum used to deconvolve them must be computed with the *same* rule.  If one
-   uses the midpoint rule and the other uses t = n dt, the ratio picks up a factor
-   exp(-i omega dt/2): a pure phase, linear in omega, which is indistinguishable
-   from a uniform wave-speed error of dt/(2 T) ~ 0.85% at f_c.  That is roughly the
-   size of the effect the inversion is trying to measure.  Both paths call
-   `source_spectrum`, and tests/test_dft_consistency.py asserts term-by-term
-   agreement.
+1. **Quadrature mismatch.**  Deconvolution divides one discrete transform by
+   another, and the two quantities do not live on the same time grid.  A leapfrog
+   scheme stores velocities at the half levels t = (n+1/2)dt, so the running DFT of
+   the A-scans uses that grid; the point force, however, is added to the velocity
+   update that steps v^{n-1/2} -> v^{n+1/2}, and that update is centred on the
+   *integer* level t = n dt, so the injected source is the sequence s(n dt).  The
+   condition is therefore not that the two transforms share an offset -- they must
+   not -- but that each uses the grid its own samples actually sit on.  Both paths
+   go through `fdtd_elastic.dft_at_freqs`, whose `t_offset` argument makes the grid
+   explicit: 1/2 for the recorded velocities, 0 for `source_spectrum`.
+
+   Getting it wrong is invisible and expensive.  Computing the source spectrum on
+   the half grid leaves exp(+i omega dt/2) on every deconvolved phasor: a pure
+   phase, linear in omega, 0.072 rad at the top of the band, which is exactly what
+   a uniform 0.85% wave-speed error looks like and the same size as the effect the
+   inversion is trying to measure.  It was in fact present until measured against
+   the analytic Green's function (`solver.validate.check_green_incident`, 6.2% ->
+   1.05% on a domain with no absorber), and `tests/test_dft_consistency.py` now
+   pins the source grid to the injection site in `fdtd_elastic.run`.
+
+   One O(dt^2) refinement is deliberately *not* applied: the leapfrog differences a
+   quantity sampled at the half levels, so its exact symbol is
+   omega_tilde = (2/dt) sin(omega dt/2) rather than omega, and dividing by
+   i*omega_tilde instead of i*omega would remove a further 0.086% at f_max.  That
+   is far below the discretisation error of the fields themselves, and introducing
+   it here would make the harmonic reduction depend on the solver's time stepping,
+   which is the coupling this module exists to avoid.
 
 2. **Band-edge conditioning.**  Deconvolution divides by s_hat(omega), and a
    5-cycle Hann burst has exact spectral nulls at f_c(1 +- 2/5) = 0.6 f_c and
@@ -247,10 +265,19 @@ def envelope(x: Tensor) -> Tensor:
     """
     |analytic signal| along the last axis, via the standard FFT Hilbert route.
 
-    Used for the envelope misfit of §8.4 and for arrival picking.  The envelope is
-    what makes the low-frequency stage robust: it discards the carrier phase, so
-    the misfit becomes a smooth function of travel time instead of oscillating with
-    period 1/f, which is the mechanism behind cycle skipping.
+    For *time-domain traces* only: arrival picking in solver check 2, through
+    `vector_envelope`, which is what callers with a vector trace should use.  The
+    inversion's envelope misfit does not come through here.  It cannot: the
+    inversion holds 20 phasors, not a trace, and synthesising a trace only to
+    Hilbert-transform it back would make the objective depend on a zero-padding
+    choice.  `inverse.timedomain.Reconstruction` builds the band-limited analytic
+    signal directly from the phasors instead, which is exact, differentiable, and
+    applied identically to prediction and observation.
+
+    Note what this function is *not* a substitute for either: |u_hat| is invariant
+    under time shift (`inverse.timedomain.shift_invariance_demo`), so a
+    magnitude-spectrum comparison is travel-time blind, while |analytic signal| is
+    shift-equivariant and is not.
     """
     nt = x.shape[-1]
     X = torch.fft.fft(x.to(torch.float64), dim=-1)
@@ -265,6 +292,33 @@ def envelope(x: Tensor) -> Tensor:
     return analytic.abs().to(x.dtype)
 
 
+def vector_envelope(x: Tensor, *, dim: int = -2) -> Tensor:
+    """
+    Orientation-free envelope of a *vector* trace: sqrt(sum_c |analytic(x_c)|^2).
+
+    `x` has its components along `dim` and time along the last axis; the component
+    axis is reduced.  For [B, R, 2, nt] ascans the default is right.
+
+    Take the analytic signal of each **signed** component and *then* the norm, never
+    the other way round.  `envelope(sqrt(vx^2 + vy^2))` is a different quantity and
+    it is a wrong one: the rectified magnitude is non-negative, so its spectrum sits
+    at DC and 2 f_c rather than at f_c, and the Hilbert transform of that is not the
+    modulating envelope of anything.  Measured on a synthetic two-phase trace with
+    exactly known arrivals -- a 2-cycle Hann burst at t = d/c_p and another at
+    d/c_s -- rectify-then-analytic misplaces both envelope peaks by 16 to 18 time
+    steps, while this function lands within 0.5, which is grid quantisation.  Solver
+    check 2 gates at 1.0 step, so the convention was most of its failure.
+
+    The componentwise analytic signal is also the right object for a physical reason
+    and not only a numerical one: it is linear, so it commutes with the rotation that
+    takes (vx, vy) to (radial, transverse), and the answer therefore does not depend
+    on which frame the receiver reports in.  `tests/test_dft_consistency.py` pins the
+    peak against the burst's analytic group delay.
+    """
+    a = torch.stack([envelope(c) ** 2 for c in x.unbind(dim)], dim=dim)
+    return a.sum(dim=dim).clamp_min(0.0).sqrt()
+
+
 def first_arrival(ascans: Tensor, *, dt: float = cfg.DT,
                   threshold: float = 0.05) -> Tensor:
     """
@@ -273,10 +327,11 @@ def first_arrival(ascans: Tensor, *, dt: float = cfg.DT,
     A fractional-of-peak threshold rather than an absolute one because the
     amplitude varies by orders of magnitude between a receiver facing the source
     and one in the shadow, while the *shape* of the leading edge does not.
-    Combines the two velocity components first, so the pick is orientation-free.
+    Combines the two velocity components through `vector_envelope`, so the pick is
+    orientation-free -- and, unlike the rectify-then-Hilbert version this used to
+    do, actually an envelope.
     """
-    mag = ascans.pow(2).sum(dim=2).sqrt()               # [B, R, nt]
-    env = envelope(mag)
+    env = vector_envelope(ascans)                       # [B, R, nt]
     peak = env.amax(dim=-1, keepdim=True).clamp_min(1e-30)
     over = env >= threshold * peak
     idx = torch.where(over.any(dim=-1),
@@ -302,4 +357,5 @@ __all__ = [
     "source_hat",
     "tail_energy_fraction",
     "transfer_factor",
+    "vector_envelope",
 ]

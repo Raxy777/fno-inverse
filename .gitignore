@@ -17,3 +17,6 @@ data/
 
 # Notebook generator scratch (outside the repo, listed for safety)
 .nbgen/
+
+.codex-build
+.codex-finalizer

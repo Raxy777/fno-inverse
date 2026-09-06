@@ -189,17 +189,48 @@ def test_reparameterisation_never_leaves_the_box():
     feasible and the gradient stays defined.  A clip would give exactly zero gradient
     at the boundary, and L-BFGS reads a zero gradient as convergence -- so a run that
     walked into the wall would report success while sitting on it.
+
+    That argument is exact in exact arithmetic and *not* exact in float32, which is
+    what this test now pins.  sigmoid'(z) = sigma (1 - sigma) is evaluated from a
+    rounded sigma, so it underflows to bitwise zero at |z| >= 16.75 in float32 (36.75
+    in float64).  Two things keep that from being a live hazard, and both are asserted
+    here: `to_unconstrained` clamps entry to |z| <= log 9999 = 9.21, where the
+    derivative is still ~1e-4 of the box width; and at the underflow point theta is
+    1.2e-6 network cells from the wall, i.e. pinned for optimiser purposes but not
+    inaccurate in any physical sense.  `InversionResult.wall_saturation` reports
+    max |z| and `summarise` warns past 12.0, so a run that does get there is visible
+    instead of being counted as a success.
     """
     fam = G.Circle()
     lo, hi = fam.bounds(LAMBDA_S)
     theta = fam.to_physical(torch.tensor([[-1e3, 1e3, 40.0]]), LAMBDA_S)
     assert (theta >= lo).all() and (theta <= hi).all()
 
-    # Saturated but not clipped: at a plausible optimiser excursion the gradient is
-    # small and still strictly positive, so a step back off the wall exists.
-    z = torch.tensor([[-20.0, 20.0, 15.0]], requires_grad=True)
+    # Entry is bounded, and the gradient there is alive.
+    z_entry = fam.to_unconstrained(torch.stack([lo, hi]), LAMBDA_S)
+    assert float(z_entry.abs().max()) == pytest.approx(math.log(9999.0), rel=1e-6)
+    z = z_entry.clone().requires_grad_(True)
     fam.to_physical(z, LAMBDA_S).sum().backward()
-    assert (z.grad.abs() > 0).all()
+    assert float(z.grad.abs().min()) > 1e-5 * float((hi - lo).min())
+
+    # The float32 underflow threshold, stated rather than assumed.
+    def first_dead(dtype):
+        for k in range(40, 400):
+            zz = torch.tensor([[k / 4.0]], dtype=dtype, requires_grad=True)
+            torch.sigmoid(zz).sum().backward()
+            if float(zz.grad.reshape(())) == 0.0:
+                return k / 4.0
+        return None
+
+    assert first_dead(torch.float32) == pytest.approx(16.75)
+    assert first_dead(torch.float64) == pytest.approx(36.75)
+
+    # ... and being there is a stuck optimiser, not an inaccurate answer.
+    z_dead = torch.full((1, 3), 16.75)
+    gap = (hi - fam.to_physical(z_dead, LAMBDA_S)[0]).abs().max()
+    assert float(gap) / cfg.DX_NET < 1e-4, (
+        "if saturation ever became physically far from the wall, the reparameterisation "
+        "would need replacing rather than merely monitoring")
 
 
 def test_inversion_box_is_wider_than_the_training_support():
@@ -238,13 +269,34 @@ def test_inversion_box_is_wider_than_the_training_support():
 # Derived fields
 # ---------------------------------------------------------------------------
 def test_soft_indicator_limits_and_monotonicity():
+    """
+    chi = sigmoid(-phi/eps) is monotone in phi, but not *strictly* so in float32.
+
+    Over phi in [-1, 1] at eps = 0.05 the argument spans +-20, and sigmoid saturates to
+    bitwise 1.0 and 0.0 well before the ends, so consecutive samples there are equal.
+    That is representation, not a modelling error -- the analytic function is strictly
+    decreasing everywhere -- so the assertion is non-increasing overall plus strictly
+    decreasing wherever the output has not saturated.  Asserting strictness across the
+    saturated tail would be asserting something float32 cannot represent.
+    """
     assert G.soft_indicator(torch.zeros(1), 0.05).item() == pytest.approx(0.5)
     phi = torch.linspace(-1.0, 1.0, 201)
     chi = G.soft_indicator(phi, 0.05)
     assert chi[0].item() > 0.999          # deep inside the void
     assert chi[-1].item() < 0.001         # deep in the solid
-    assert (chi.diff() < 0).all()         # strictly decreasing in phi
-    assert (chi > 0).all() and (chi < 1).all()
+    assert (chi.diff() <= 0).all()        # monotone, everywhere
+    # Strictly decreasing across the transition itself.  Not in the tails: near chi = 1
+    # the spacing between float32 values is 6e-8 while the true decrement per sample is
+    # ~1e-8, so consecutive samples are the same number there -- the resolution runs out
+    # before the monotonicity does.  The transition band is the part chi is for.
+    live = (chi[:-1] < 0.99) & (chi[1:] > 0.01)
+    assert live.sum() > 20, "the transition band should span many samples"
+    assert (chi.diff()[live] < 0).all(), "strictly decreasing across the interface"
+    assert (chi >= 0).all() and (chi <= 1).all()
+    # in float64 the same grid is strictly monotone throughout
+    chi64 = G.soft_indicator(phi.double(), 0.05)
+    assert (chi64.diff() < 0).all()
+    assert (chi64 > 0).all() and (chi64 < 1).all()
 
 
 def test_phi_tilde_is_clipped_in_cell_units():
@@ -281,13 +333,14 @@ def test_interface_width_is_physical_not_grid_relative():
     # calling it with the fine dx halves the physical width.  That is legitimate
     # for building network inputs on the network grid, and wrong for building
     # solver material fields -- which is precisely why validate.py defines
-    # EPS_LEN_PHYS = EPS_INTERFACE_CELLS * DX_NET and passes the length around.
+    # EPS_LEN_PHYS = EPS_INTERFACE_PHYS and passes the length around.
     _, chi_net = G.geometry_channels(theta, fam, dx=cfg.DX_NET, yy=yc_, xx=xc_)
     _, chi_fine = G.geometry_channels(theta, fam, dx=cfg.DX_FINE, yy=yc_, xx=xc_)
     assert not torch.allclose(chi_net, chi_fine, atol=1e-3)
 
     from src.solver import validate as V
-    assert V.EPS_LEN_PHYS == pytest.approx(cfg.EPS_INTERFACE_CELLS * cfg.DX_NET)
+    assert V.EPS_LEN_PHYS == pytest.approx(cfg.EPS_INTERFACE_PHYS)
+    assert V.EPS_LEN_PHYS == pytest.approx(cfg.EPS_INTERFACE_FINE_CELLS * cfg.DX_FINE)
 
 
 def test_geometry_channels_shapes_and_defaults():
@@ -300,12 +353,19 @@ def test_geometry_channels_shapes_and_defaults():
     assert pt_f.shape == (2, cfg.N_FINE_TOTAL, cfg.N_FINE_TOTAL)
 
 
-def test_material_fields_void_is_soft_but_not_lighter():
+def test_material_fields_void_is_soft_and_light():
     """
-    VOID_DENSITY_SCALE = 1.0: the moduli collapse, the density does not.  A void's
-    physics is mu -> 0 (traction-free); nulling rho as well makes the local wave
-    speed a 0/0 whose numerical value can exceed c_p and break the CFL condition
-    that the whole time step was sized against.
+    The moduli collapse to VOID_STIFFNESS_FLOOR and the density to
+    VOID_DENSITY_SCALE, so the void interior is soft *and* light -- §7.2's
+    delta-rho = -rho_0 chi, floored rather than nulled.
+
+    An earlier version of this test asserted the density was retained, on the theory
+    that nulling it makes the local speed a 0/0 that can exceed c_p.  It cannot: with
+    both floors active sqrt(solid/rho) = 0.1 c_p.  What actually diverges is a *face*
+    just inside a sharp interface, where `avg_plus(rho, -2)` and the two-cell stress
+    stencil pair a small density with full-strength stiffness; see
+    `config.VOID_DENSITY_SCALE`.  Retaining the density instead loads the boundary
+    with the void's own mass, worth 77.6% against 10.4% cavity error.
     """
     lam0, mu0 = cfg.lame_from_nu(0.33)
     chi = torch.tensor([[0.0, 0.5, 1.0]])
@@ -316,7 +376,15 @@ def test_material_fields_void_is_soft_but_not_lighter():
     assert lam[0, 2].item() == pytest.approx(lam0 * cfg.VOID_STIFFNESS_FLOOR)
     assert mu[0, 2].item() == pytest.approx(mu0 * cfg.VOID_STIFFNESS_FLOOR)
     assert mu[0, 1].item() == pytest.approx(0.5 * mu0)
-    assert torch.allclose(rho, torch.full_like(rho, cfg.RHO0))
+
+    assert rho[0, 0].item() == pytest.approx(cfg.RHO0)
+    assert rho[0, 2].item() == pytest.approx(cfg.RHO0 * cfg.VOID_DENSITY_SCALE)
+    assert rho[0, 1].item() == pytest.approx(cfg.RHO0 * 0.5 * (1 + cfg.VOID_DENSITY_SCALE))
+
+    # The speed the CFL condition sees at a fully voided cell centre, which is where
+    # the old justification for retaining rho went wrong.
+    c_void = math.sqrt((lam[0, 2] + 2 * mu[0, 2]).item() / rho[0, 2].item())
+    assert c_void < cfg.CP, (c_void, cfg.CP)
 
     # The floor keeps the local speed finite and *below* c_p, so no cell in the
     # void ever violates the global CFL condition.
@@ -355,22 +423,84 @@ def test_smooth_min_has_a_gradient_at_the_crossing():
     assert b.grad.item() == pytest.approx(0.5)
 
 
-def test_ellipse_reduces_to_the_first_order_circle():
+def test_ellipse_reduces_to_the_circle_exactly_not_approximately():
     """
-    With a = b = A the normalised implicit function is exactly
-    (r^2 - A^2) / (2 r), which vanishes on the boundary and agrees with the true
-    distance to first order there.  Exactness *on* the boundary is all that is
-    needed, because that is the only place chi has support.
+    Normalising h = s - 1 rather than g = s^2 - 1 makes the circular limit
+    *exact*, and this test is the reason it matters.
+
+    The transfer experiment of §8.5 goes circles -> mildly eccentric ellipses.
+    For eccentricity to be the only variable, a zero-eccentricity `Ellipse` must
+    hand the surrogate byte-for-byte the input a `Circle` would; the network sees
+    phi_tilde over +-SDF_CLIP_CELLS, so agreement on the boundary alone is not
+    enough.  The old g-normalisation returned (r^2 - A^2)/(2r) = (r - A) *
+    (s + 1)/(2 s), which is exact on phi = 0 and 17% short at r = 1.5 A -- an
+    input-distribution shift that would have been read as a shape-transfer
+    result.
     """
     fam = G.Ellipse()
     A = 0.7
-    theta = torch.tensor([[4.0, 4.0, A, A, 0.0]], dtype=torch.float64)
     yy, xx = G.grid_coords(48, cfg.L_DOMAIN / 48, dtype=torch.float64)
-    phi = fam.sdf(theta, yy, xx)[0]
     r = torch.sqrt((xx - 4.0) ** 2 + (yy - 4.0) ** 2)
-    assert torch.allclose(phi, (r ** 2 - A ** 2) / (2.0 * r), atol=1e-9)
-    near = (r - A).abs() < 0.05
-    assert torch.allclose(phi[near], (r - A)[near], atol=3e-3)
+
+    for alpha in (0.0, 0.37, math.pi / 2):
+        theta = torch.tensor([[4.0, 4.0, A, A, alpha]], dtype=torch.float64)
+        phi = fam.sdf(theta, yy, xx)[0]
+        assert torch.allclose(phi, r - A, atol=1e-12), (
+            f"the circular limit must be the exact distance at alpha={alpha}, and "
+            "must not depend on alpha at all")
+
+    # identical to what the trained family produces, which is the actual claim
+    phi_c = G.Circle().sdf(torch.tensor([[4.0, 4.0, A]], dtype=torch.float64),
+                           yy, xx)[0]
+    theta = torch.tensor([[4.0, 4.0, A, A, 0.0]], dtype=torch.float64)
+    assert torch.allclose(fam.sdf(theta, yy, xx)[0], phi_c, atol=1e-12)
+
+
+def test_ellipse_sdf_beats_the_g_normalisation_off_the_boundary():
+    """
+    For a genuinely eccentric ellipse neither form is the true distance, but the
+    s-normalisation is several times closer, measured against a brute-force
+    nearest-point distance to a densely sampled boundary.
+
+    The two differ by exactly (s + 1) / (2 s), so this also pins the algebra: if
+    someone reverts sdf() to normalising g, `old` below becomes the new output
+    and the assertion that it is worse fails.
+    """
+    fam = G.Ellipse()
+    a, b, al = 1.6, 0.9, 0.4
+    xc, yc = 4.0, 4.2
+    theta = torch.tensor([[xc, yc, a, b, al]], dtype=torch.float64)
+    yy, xx = G.grid_coords(96, cfg.L_DOMAIN / 96, dtype=torch.float64)
+    phi = fam.sdf(theta, yy, xx)[0]
+
+    t = torch.linspace(0.0, 2.0 * math.pi, 8001, dtype=torch.float64)
+    bx = xc + a * torch.cos(t) * math.cos(al) - b * torch.sin(t) * math.sin(al)
+    by = yc + a * torch.cos(t) * math.sin(al) + b * torch.sin(t) * math.cos(al)
+    boundary = torch.stack([bx, by], dim=1)
+
+    band = phi.abs() < 0.5                      # where chi has any support
+    pts = torch.stack([xx[band], yy[band]], dim=1)
+    d = torch.cat([torch.cdist(pts[i:i + 512], boundary).min(dim=1).values
+                   for i in range(0, pts.shape[0], 512)])
+    true = torch.sign(phi[band]) * d
+
+    xp = math.cos(al) * (xx - xc) + math.sin(al) * (yy - yc)
+    yp = -math.sin(al) * (xx - xc) + math.cos(al) * (yy - yc)
+    s = torch.sqrt((xp / a) ** 2 + (yp / b) ** 2 + 1e-30)
+    old = phi * (s + 1.0) / (2.0 * s)           # the g-normalisation, exactly
+
+    err_new = (phi[band] - true).abs().max()
+    err_old = (old[band] - true).abs().max()
+    assert err_new < 0.11, f"true-distance error {float(err_new):.4f} in a 0.5 band"
+    assert err_new < 0.25 * err_old, (
+        f"s-normalisation error {float(err_new):.4f} vs g-normalisation "
+        f"{float(err_old):.4f}; the improvement off the boundary is the point")
+    # still exact on the boundary, which is what chi actually integrates over
+    edge = phi.abs() < 0.02
+    assert (phi[edge] - torch.sign(phi[edge]) * torch.cat(
+        [torch.cdist(torch.stack([xx[edge], yy[edge]], dim=1)[i:i + 512],
+                     boundary).min(dim=1).values
+         for i in range(0, int(edge.sum()), 512)])).abs().max() < 5e-3
 
 
 def test_ellipse_rotation_is_a_rotation():

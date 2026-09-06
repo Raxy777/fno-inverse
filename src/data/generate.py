@@ -31,10 +31,12 @@ Stored quantities and their conventions:
 * `incident/*` -- the corresponding incident quantities, indexed [src, nu].
 
 The interface width used by the solver is the *physical* width the network sees
-(EPS_INTERFACE_CELLS network cells), not that many cells of the finer solver grid.
-Getting this wrong makes the label describe a slightly different void from the one
-the input channels describe -- a small, systematic, and completely invisible
-inconsistency.
+(`cfg.EPS_INTERFACE_PHYS`), not a fixed number of cells of whichever grid is in front
+of it.  Getting this wrong makes the label describe a slightly different void from the
+one the input channels describe -- a small, systematic, and completely invisible
+inconsistency.  The width itself was set by measuring the exterior scattered field
+against an analytic traction-free cavity (`solver.validate.check_cavity_scattering`),
+so it is part of the label definition and is snapshotted with the dataset.
 """
 
 from __future__ import annotations
@@ -53,7 +55,7 @@ from ..geometry.sdf import Circle, fine_coords, material_fields, soft_indicator
 from ..solver import harmonic as H
 from ..solver.fdtd_elastic import ElasticFDTD2D
 
-EPS_LEN_PHYS: float = cfg.EPS_INTERFACE_CELLS * cfg.DX_NET
+EPS_LEN_PHYS: float = cfg.EPS_INTERFACE_PHYS
 SRC_KEEPOUT_LS: float = 1.0        # void boundary to source, in shear wavelengths
 
 
@@ -265,12 +267,22 @@ def calibrate(device=None, nt: int = 50, batch: int = cfg.GEN_BATCH) -> float:
 # ---------------------------------------------------------------------------
 # Config snapshot, so a dataset can be checked against the code that reads it
 # ---------------------------------------------------------------------------
+# Everything here changes what the *labels are*, as opposed to how they are used, so a
+# mismatch has to be a hard refusal rather than a warning.  The interface and void
+# constants are in the list because they were set by measurement against an analytic
+# cavity and have moved once already: a dataset generated at the v2.0 width and full
+# void density is a dataset of soft heavy inclusions, and nothing downstream can tell
+# from the file.  `SOURCE_FORCE_XY` is in for the same reason one step further out --
+# it encodes the y-face offset of the point force, which is the frame every analytic
+# reference is evaluated in.
 _SNAPSHOT_KEYS = (
     "L_DOMAIN", "N_NET", "N_FINE", "N_FINE_TOTAL", "N_PML_FINE", "DX_NET", "DX_FINE",
     "DOWNSAMPLE", "DT", "NT", "T_END", "CFL_NUMBER", "N_CYCLES", "M_FREQ", "F_START",
     "DF", "N_RECV", "N_SRC", "RING_INSET_NET", "EPS_INTERFACE_CELLS",
+    "EPS_INTERFACE_FINE_CELLS", "EPS_INTERFACE_PHYS",
     "VOID_DENSITY_SCALE", "VOID_STIFFNESS_FLOOR", "R_MIN_LS", "R_MAX_LS",
-    "BOUNDARY_KEEPOUT_LS", "DFT_EVERY",
+    "BOUNDARY_KEEPOUT_LS", "DFT_EVERY", "ABSORBER_ORDER", "ABSORBER_R_TARGET",
+    "N_ABSORBER_FINE",
 )
 
 
@@ -279,6 +291,11 @@ def config_snapshot() -> dict:
     snap["NU_LIST"] = list(cfg.NU_LIST)
     snap["FREQS"] = list(cfg.FREQS)
     snap["EPS_LEN_PHYS"] = EPS_LEN_PHYS
+    # The source convention, flattened: (x, y) of every point force, including the
+    # half-fine-cell y-face offset.  Snapshotted as a vector rather than asserted in
+    # prose because a dataset made before that offset was pinned down differs from
+    # this one by 0.26 rad of shear phase at f_max, which reads as a wave-speed error.
+    snap["SOURCE_FORCE_XY"] = [v for xy in cfg.SOURCE_FORCE_XY for v in xy]
     return snap
 
 
@@ -294,6 +311,18 @@ def assert_compatible(f: h5py.File) -> None:
                 if isinstance(want, float) else want == got)
         if not same:
             bad.append(f"{k}: file has {got}, config has {want}")
+
+    want_src = np.asarray([v for xy in cfg.SOURCE_FORCE_XY for v in xy], float)
+    if "SOURCE_FORCE_XY" not in f.attrs:
+        bad.append("SOURCE_FORCE_XY: missing from file (generated before the point "
+                   "force's y-face offset was pinned down; the labels carry a "
+                   "half-fine-cell source shift)")
+    else:
+        got_src = np.asarray(f.attrs["SOURCE_FORCE_XY"], float)
+        if got_src.shape != want_src.shape or not np.allclose(got_src, want_src,
+                                                              atol=1e-9):
+            bad.append(f"SOURCE_FORCE_XY: file has {got_src.tolist()[:4]}..., "
+                       f"config has {want_src.tolist()[:4]}...")
     if bad:
         raise AssertionError(
             "dataset was generated under a different configuration:\n  "

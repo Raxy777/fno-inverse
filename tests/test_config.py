@@ -40,7 +40,7 @@ def test_grid_ratios():
     assert cfg.DOWNSAMPLE == 2
     assert cfg.DX_NET == pytest.approx(cfg.LAMBDA_P / 16)
     assert cfg.DX_FINE == pytest.approx(cfg.LAMBDA_P / 32)
-    assert cfg.N_FINE_TOTAL == cfg.N_FINE + 2 * cfg.N_PML_FINE == 316
+    assert cfg.N_FINE_TOTAL == cfg.N_FINE + 2 * cfg.N_PML_FINE == 376
     # The absorber is a whole number of network cells thick, so a network-grid
     # index maps to a fine index without a half-cell fudge.
     assert cfg.N_PML_FINE % cfg.DOWNSAMPLE == 0
@@ -350,6 +350,71 @@ def test_source_position_exposes_the_quarter_cell_offset():
     assert all(0.0 < v < cfg.L_DOMAIN for xy in cfg.SOURCE_XY for v in xy)
 
 
+def test_source_force_position_adds_the_y_face_offset():
+    """
+    The force enters `vy`, which lives on y-faces, so the point force is half a
+    *fine* cell above `source_position` -- a different offset from the quarter net
+    cell above, and on top of it.
+
+    Worth its own test because the two are a plausible-looking pair to collapse into
+    one, and 0.5 dx_fine is 0.26 rad of shear phase at the top of the band, larger
+    than GATE_CAVITY_PHASE_RAD.  `solver.validate.check_green_incident` compares the
+    solver against an analytic Green's function evaluated here, and would fail for
+    the wrong reason if this drifted.
+    """
+    for i in range(cfg.N_SRC):
+        x, y = cfg.source_position(i)
+        fx, fy = cfg.source_force_position(i)
+        assert fx == pytest.approx(x, rel=1e-12)
+        assert fy - y == pytest.approx(0.5 * cfg.DX_FINE, rel=1e-12)
+    assert cfg.SOURCE_FORCE_XY[0] == cfg.source_force_position(0)
+    assert cfg.source_force_position(0) == pytest.approx((2.078125, 0.21875))
+
+
+def test_absorber_is_labelled_as_a_sponge():
+    """
+    Finding (c) of the architecture review: the boundary treatment is a graded
+    damping sponge, not a split-field PML, and the write-up used to call it a PML.
+    The name is a config constant so that generated captions read it instead of
+    asserting it, and `ABSORBER_R_TARGET` is a *design input* to `absorber_d0`,
+    not an achieved reflection -- `solver.validate.check_absorber_reflection`
+    measures what the layer actually does.
+
+    The thickness rule asserted below is the review's other half, "validate the sponge
+    honestly", turned into a constraint.  It is measured, not conventional: against a
+    padded open domain the artefact on the incident ring field is 8.1% at 0.74
+    lambda_p(f_lo), 4.4% at 0.91 and 1.0% at 1.24, and at the two thin thicknesses no
+    order in 4..6 and no R_target in 1e-2..1e-1 reached GATE_ABSORBER_REFLECTION.  So
+    the binding quantity is thickness measured in the *longest* wavelength in the band,
+    and one of those is the floor.  The v2.0 layer was 0.62 and failed the gate 11x.
+    """
+    assert cfg.ABSORBER_KIND == "graded sponge"
+    assert "pml" not in cfg.ABSORBER_KIND.lower()
+    # the deprecated aliases still point at the primary constants
+    assert cfg.N_PML_FINE == cfg.N_ABSORBER_FINE
+    assert cfg.N_PML_NET == cfg.N_ABSORBER_NET
+    assert cfg.N_ABSORBER_FINE == cfg.DOWNSAMPLE * cfg.N_ABSORBER_NET
+    assert cfg.PML_ORDER == cfg.ABSORBER_ORDER
+    assert cfg.PML_R_TARGET == cfg.ABSORBER_R_TARGET
+    # more than one wavelength thick at the *lowest* frequency in the band
+    lam_p_lo = cfg.CP / min(cfg.FREQS)
+    assert lam_p_lo == pytest.approx(1.5151515, rel=1e-6)
+    thickness = cfg.N_ABSORBER_FINE * cfg.DX_FINE
+    assert thickness / lam_p_lo > 1.0, "below one lambda_p(f_lo) the gate is unreachable"
+    assert thickness / lam_p_lo == pytest.approx(1.2375, rel=1e-4)
+    # R_target sits at the measured interior minimum, not at the smallest value: d0
+    # grows like -ln(R_target) and it is the gradient of d that an unmatched layer
+    # reflects, so the v2.0 reasoning "smaller is better" had the sign wrong.
+    assert cfg.ABSORBER_R_TARGET == 3.0e-2
+    assert cfg.absorber_d0() == pytest.approx(4.67541, rel=1e-4)
+    assert cfg.absorber_d0() < cfg.absorber_d0(r_target=1.0e-4)
+    assert cfg.absorber_d0() * cfg.DT < 0.2, "damping must be gentle per time step"
+    # the padded grid follows the thickness
+    assert cfg.N_FINE_TOTAL == cfg.N_FINE + 2 * cfg.N_ABSORBER_FINE == 376
+    cost = (cfg.N_FINE_TOTAL / (cfg.N_FINE + 2 * 30)) ** 2
+    assert cost == pytest.approx(1.4159, rel=1e-3), "cost multiplier vs the v2.0 layer"
+
+
 # ---------------------------------------------------------------------------
 # Void size, keep-out, and the screening grid
 # ---------------------------------------------------------------------------
@@ -359,53 +424,223 @@ def test_void_radius_range_is_resolvable_and_scattering():
     r_max = cfg.R_MAX_LS * cfg.LAMBDA_S_MIN
     assert r_min / cfg.DX_NET > 2.5, "smallest void must span several network cells"
     assert 2.0 * r_max < cfg.L_DOMAIN / 4.0, "largest void must not fill the domain"
-    assert cfg.EPS_INTERFACE_CELLS * cfg.DX_NET < r_min / 3.0, (
-        "interface smoothing must be small against the smallest radius")
 
 
-def test_screen_grid_is_finer_than_the_envelope_basin_but_not_the_waveform_basin():
+def test_interface_transition_is_narrower_than_the_smallest_void():
     """
-    The 16 x 16 screen steps 0.41 lambda_p across the interior.  Two basin scales
-    matter and the screen sits between them, which is the whole argument for Stage 1
-    using a phase-free misfit:
+    The former largest physical discrepancy, now closed by measurement.
 
-        waveform basin   lambda_s / 4          = 0.11    screen step is 3.7x too coarse
-        envelope basin   N_c lambda_s / 2      = 1.14    screen step is 2.7x finer
+    An older version of this test asserted `EPS_INTERFACE_CELLS * DX_NET < r_min / 3`,
+    i.e. "the interface smoothing is small against the smallest radius", and it passed
+    -- on both sides of a unit error.  `eps` is the sigmoid's *scale*, not its width:
+    chi = sigmoid(-phi/eps) crosses from 10% to 90% over 2 ln(9) eps = 4.39 eps.  At
+    the v2.0 width of 1.5 network cells the honest comparison read
 
-    So a screen scored on the ordinary complex misfit would step clean over the true
-    minimum -- 256 candidates and none of them in the basin -- and the failure would
-    present as a bad forward model rather than as a sampling artefact.  Scored on the
-    amplitude (envelope) misfit, whose basin is N_c/2 times wider because it is blind
-    to carrier phase, the coverage is guaranteed by a factor of nearly three.
+        eps                        1.5 net cells = 0.094
+        10-90% transition          6.59 cells    = 0.412      4.39x larger
+        transition / lambda_s      0.91                       worst-case material
+        transition / r_min         2.27                       NOT < 1/3.  Not < 1.
 
-    config.self_check asserts the second inequality against the nu = 1/3 reference
-    material; this test asserts it at the *worst* material, where lambda_s is 9%
-    shorter and the basin correspondingly tighter.
+    so at the small end of the radius range the model was not a slightly smoothed
+    cavity: the transition was more than twice as wide as the defect was across.  That
+    is a question about the exterior scattered field -- the only place the network and
+    the inversion ever look -- and therefore a measurement, which
+    `solver.validate.check_cavity_scattering` now makes against GATE_CAVITY_REL_L2 and
+    GATE_CAVITY_PHASE_RAD.  It came back 84% wrong, and the interface was one of the
+    two reasons.
+
+    The width is now set from that measurement rather than argued for: the cavity error
+    as a function of the 10-90% width, in *fine* cells, is a U with a broad flat
+    bottom (see `config.EPS_INTERFACE_FINE_CELLS` and
+    `solver.validate.check_interface_width`), and the production value sits on it.  The
+    left branch is the physical objection above; the right branch is a sigmoid narrower
+    than the cell that samples it, which is a staircase and over-scatters.  Both bounds
+    are pinned below, because the constant is no longer free: moving it in either
+    direction makes the labels less like cavity scattering.
+
+    The three knobs that collide here are still the same three, and the resolution is
+    now on the record:
+
+      - R_MIN_LS stays at 0.4 lambda_s -- the transition is 0.28 of it, so the small
+        end of the radius range no longer has to be given up,
+      - eps is as *large* as the flat bottom allows, because `dchi/dtheta` has support
+        eps and that is the inversion's entire shape gradient,
+      - dx refines independently, because EPS_INTERFACE_PHYS is a length; that
+        separation is `check_interface_width` part B, measured flat to 0.2 points
+        across a 3x refinement.
+    """
+    r = cfg.interface_report()
+
+    assert cfg.EPS_TRANSITION_FACTOR == pytest.approx(4.3944, abs=1e-4)
+    assert r["transition_fine_cells"] == pytest.approx(1.648, abs=1e-3)
+    assert r["transition_cells"] == pytest.approx(0.824, abs=1e-3)
+    assert r["transition_phys"] == pytest.approx(0.05150, abs=1e-5)
+    assert r["transition_over_lambda_s_worst"] == pytest.approx(0.1134, abs=1e-4)
+    assert r["ratio_to_r_min"] == pytest.approx(0.2834, abs=1e-4)
+    assert r["ratio_to_r_min"] < 1.0 / 3.0, (
+        "the interface must be narrow against the smallest defect; this is the "
+        "assertion the v2.0 test claimed to make and did not")
+    assert r["transition_fine_cells"] > 1.0, (
+        "a 10-90% transition narrower than one *fine* cell is a staircase, not a "
+        "smooth interface, and the measured cavity error turns back up: 0.99 cells "
+        "reads 12.1% against 10.4% at the production width")
+
+    # The impedance the "void" actually presents: sqrt(stiffness * density), both
+    # floors together.  1e-3 of the host, against 1e-2 when density was retained.
+    assert r["impedance_ratio"] == pytest.approx(1e-3, rel=1e-12)
+
+    # EPS_INTERFACE_PHYS is the quantity a grid-refinement study holds fixed, so it
+    # must be a length.  It is now defined in *fine* cells, because the sampling that
+    # decides the right-hand branch of the U is the solver's, not the network's, and
+    # EPS_INTERFACE_CELLS is derived from it for the network grid.
+    assert cfg.EPS_INTERFACE_PHYS == pytest.approx(
+        cfg.EPS_INTERFACE_FINE_CELLS * cfg.DX_FINE, rel=1e-12)
+    assert cfg.EPS_INTERFACE_CELLS == pytest.approx(
+        cfg.EPS_INTERFACE_PHYS / cfg.DX_NET, rel=1e-12)
+    assert cfg.interface_report(eps_cells=2.0 * cfg.EPS_INTERFACE_CELLS,
+                                dx=cfg.DX_NET / 2.0)["eps_phys"] == (
+        pytest.approx(cfg.EPS_INTERFACE_PHYS, rel=1e-12)), (
+        "doubling the resolution at fixed physical interface width must double the "
+        "cell count; if this identity breaks, grid convergence and interface "
+        "convergence are being measured as one thing")
+
+
+def test_screen_grid_is_coarser_than_the_waveform_basin():
+    """
+    The 16 x 16 screen steps 0.44 = 0.97 lambda_s across the interior, and the
+    complex-waveform basin is about lambda_s / 4 = 0.11.  The screen is therefore
+    8.6x too coarse to be scored on the ordinary complex misfit: it would step clean
+    over the true minimum, 256 candidates and none of them in the basin, and the
+    failure would present as a bad forward model rather than as a sampling artefact.
+
+    That inequality is the entire reason Stage 1 uses a different objective from
+    Stage 3, so it is asserted rather than assumed.  If it ever becomes false the
+    screen has become fine enough to score on the waveform misfit directly, stages 1
+    and 2 are redundant, and §8.4 should say so.
+
+    The step is `interior / (SCREEN_GRID - 1)`, not `interior / SCREEN_GRID`.  That is
+    an off-by-one worth spelling out because both versions of this test had the second
+    form and it flatters the screen: `inverse.invert.screen_candidates` builds the
+    lattice with `torch.linspace(lo, hi, n_grid)`, which is endpoint-inclusive and so
+    has 15 intervals, not 16.  Endpoint-inclusive is the right choice -- a void may
+    legitimately sit exactly on the keepout boundary, and a cell-centred lattice would
+    leave the corners of the feasible box further from any candidate than the interior
+    is -- but it means the real node spacing is 7% larger than the cell width, and the
+    error is in the unsafe direction.
+
+    config.self_check asserts the same inequality at the nu = 1/3 reference material and
+    over the full domain span; this test uses the interior span reachable by
+    `screen_candidates` at the *worst* material, where lambda_s is 9% shorter and the
+    basin correspondingly tighter.  The tighter basin is the one that has to lose.
     """
     interior = cfg.L_DOMAIN - 2.0 * cfg.BOUNDARY_KEEPOUT_LS * cfg.LAMBDA_S_MIN
-    step = interior / cfg.SCREEN_GRID
+    step = interior / (cfg.SCREEN_GRID - 1)
     basin_waveform = cfg.LAMBDA_S_MIN / 4.0
-    basin_envelope = cfg.N_CYCLES * cfg.LAMBDA_S_MIN / 2.0
 
-    assert step == pytest.approx(0.4148, abs=1e-3)
-    assert step > basin_waveform, (
-        "if this ever becomes false the phase-free Stage 1 misfit is no longer "
-        "load-bearing and §8.4 should say so")
-    assert step < basin_envelope / 2.0
+    assert step == pytest.approx(0.4425, abs=1e-3)
+    assert step / cfg.LAMBDA_S_MIN == pytest.approx(0.974, abs=1e-3)
+    assert step > basin_waveform
     assert cfg.N_SURVIVORS < cfg.SCREEN_GRID ** 2
+
+
+def test_envelope_basin_scale_narrows_as_the_band_widens():
+    """
+    The screen's basin, done with the corrected arithmetic (§8.4).
+
+    v2.0 claimed the Stage 1 basin was `N_c lambda_s / 2` = 1.14 because the misfit
+    was "phase-free".  It was phase-free in the fatal sense: a magnitude-spectrum
+    misfit satisfies |g_hat(w) e^{-i w tau}| = |g_hat(w)| exactly, so it does not see
+    a travel-time shift at all and has no basin in the shift direction -- it has a
+    flat plateau.  `inverse.timedomain.shift_invariance_demo` exhibits that identity
+    numerically.  The number was arithmetic about the wrong object.
+
+    A band-limited *envelope*, reconstructed over the stage's frequencies, does have
+    a real basin, and its width is set by the reconstruction bandwidth rather than by
+    the burst length: an envelope of bandwidth B decorrelates over a delay ~1/B, and
+    a travel-time error tau maps to a position error c_s tau, so
+
+        full basin width ~ c_s / B = (f_c / B) lambda_s.
+
+    Hence the corollary that catches people out, and the reason this is a test: the
+    envelope basin *narrows* as the band widens.  Stage 1's six frequencies span
+    0.179 f_c and give 5.6 lambda_s; the full 20 span 0.680 f_c and give 1.5.  A
+    well-meant change that widened Stage 1's band to "use more data" would shrink its
+    basin by 3.8x and break the screen, silently.
+
+    These are scale estimates for a smooth single-scatterer response, not bounds --
+    elastic multipath and mode conversion put structure inside the envelope.  The
+    coverage claim they used to support is now measured, not asserted, in two places:
+    `inverse.misfit.envelope_basin_width` maps the actual basin of the actual
+    objective, and `inverse.invert.screen_capture_rate` measures the fraction of
+    screens whose survivor set contains the true basin, against GATE_SCREEN_CAPTURE.
+    """
+    basin_ls = {}
+    for stage, band in ((1, cfg.BAND_STAGE1), (2, cfg.BAND_STAGE2),
+                        (3, cfg.BAND_STAGE3)):
+        f = cfg.FREQS[band]
+        bandwidth = f[-1] - f[0]
+        assert bandwidth > 0.0
+        basin_ls[stage] = 1.0 / bandwidth          # in lambda_s, material-free
+
+    assert basin_ls[1] == pytest.approx(5.59, abs=0.02)
+    assert basin_ls[2] == pytest.approx(3.10, abs=0.02)
+    assert basin_ls[3] == pytest.approx(1.47, abs=0.02)
+    assert basin_ls[1] > basin_ls[2] > basin_ls[3], (
+        "the band-limited envelope basin must narrow as the band widens; if this "
+        "ordering breaks, the frequency continuation of §8.4 is running backwards")
+
+    # Necessary condition for the screen: the worst point of an n x n lattice cell is
+    # sqrt(2)/2 of a step from the nearest node, and that has to sit inside the Stage
+    # 1 basin's half-width with room to spare.  Both sides scale with lambda_s, so the
+    # margin is material-independent -- and it is a necessary condition only, which is
+    # why GATE_SCREEN_CAPTURE exists.  The step is interior / (SCREEN_GRID - 1): the
+    # lattice `screen_candidates` builds is endpoint-inclusive, so it has 15 intervals.
+    interior_ls = (cfg.L_DOMAIN
+                   - 2.0 * cfg.BOUNDARY_KEEPOUT_LS * cfg.LAMBDA_S_MIN) / cfg.LAMBDA_S_MIN
+    worst_node_ls = math.sqrt(2.0) / 2.0 * interior_ls / (cfg.SCREEN_GRID - 1)
+    margin = 0.5 * basin_ls[1] / worst_node_ls
+
+    assert worst_node_ls == pytest.approx(0.689, abs=1e-3)
+    assert margin == pytest.approx(4.06, abs=0.02)
+    assert margin > 2.0, (
+        f"screen leaves points {worst_node_ls:.2f} lambda_s from the nearest "
+        f"candidate against a Stage 1 basin half-width of {0.5 * basin_ls[1]:.2f}: "
+        "raise SCREEN_GRID or narrow BAND_STAGE1")
 
 
 def test_void_material_scaling():
     """
-    VOID_DENSITY_SCALE = 1.0 is a documented deviation: section 7.2 writes the
-    contrast as delta-rho = -rho_0 chi, but scaling density to zero inside the void
-    makes the explicit time step's local CFL condition blow up (c = sqrt(mu/rho)
-    with both going to zero is a 0/0 whose numerical value is set by the
-    stiffness floor).  Keeping rho fixed and softening only the moduli gives a
-    traction-free hole with a stable step; the physics of a void is in mu -> 0.
+    The void is soft *and* light, and both floors were set by measurement.
+
+    v2.0 kept the full density (VOID_DENSITY_SCALE = 1.0) and called it a documented
+    deviation from §7.2's delta-rho = -rho_0 chi, on the grounds that nulling density
+    makes c = sqrt(mu/rho) a 0/0 limit whose value is set by the stiffness floor.  That
+    reason was wrong: with both floors active the cell-centred speed is
+    sqrt(1e-4/1e-2) = 0.1 c_p, and it is bounded by c_p for every chi in between, so
+    there is no CFL blow-up at cell centres at all.
+
+    The real constraint is that the solver does not evaluate either field at a cell
+    centre alone -- `rho_vy = avg_plus(rho, -2)` averages neighbouring densities while
+    the 4th-order stress stencil reaches two cells, so a face just inside a *sharp*
+    void combines a small density with full-strength stiffness from two cells away.  At
+    1e-4 with a sub-cell interface that diverges (step 200 of 1408).  1e-2 is stable at
+    the production interface width, and leaves a residual impedance of
+    sqrt(VOID_STIFFNESS_FLOOR * VOID_DENSITY_SCALE) = 1e-3 of the host.
+
+    Retaining the full density is not a small deviation, which is why this test no
+    longer records it as one.  The void interior becomes a bag of nearly free masses
+    whose first layer rides on the interface as an added mass, loading it by k_s dx =
+    0.43 at f_max.  Measured against the analytic traction-free cavity at the
+    production interface width: 77.6% relative error with rho retained, 10.4% without
+    (`solver.validate.check_cavity_scattering`, which can reproduce both rows).
     """
-    assert cfg.VOID_DENSITY_SCALE == 1.0
+    assert cfg.VOID_DENSITY_SCALE == 1e-2
+    assert 0.0 < cfg.VOID_DENSITY_SCALE < 1.0, (
+        "section 7.2 asks for delta-rho = -rho_0 chi; this is the nearest stable "
+        "thing to it, and 1.0 is not it")
     assert 0.0 < cfg.VOID_STIFFNESS_FLOOR <= 1e-3
+    assert math.sqrt(cfg.VOID_STIFFNESS_FLOOR * cfg.VOID_DENSITY_SCALE) < 1e-2, (
+        "residual impedance of the 'void' relative to the host")
     assert cfg.ERODE_CELLS == cfg.STENCIL_HALF_WIDTH + 1 == 3
 
 
