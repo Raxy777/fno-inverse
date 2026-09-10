@@ -236,7 +236,8 @@ def _trace_weights(obs_env: Tensor, eps: float) -> Tensor:
 
 
 def envelope_misfit(pred: Tensor, obs: Tensor, *, recon: Reconstruction | None = None,
-                    band: slice = cfg.BAND_STAGE1, eps: float = 1e-30) -> Tensor:
+                    band: slice = cfg.BAND_STAGE1, scale_invariant: bool = False,
+                    eps: float = 1e-30) -> Tensor:
     """
     Relative squared error between analytic-signal envelopes.  [B]
 
@@ -247,6 +248,11 @@ def envelope_misfit(pred: Tensor, obs: Tensor, *, recon: Reconstruction | None =
     unlike the complex misfit it has no carrier in it, so a half-period error costs
     almost nothing and cycle skipping is suppressed rather than merely hidden.
 
+    When `scale_invariant` is true, fit the nonnegative least-squares amplitude of
+    each predicted envelope to the observed envelope before scoring.  The screen
+    uses this because it evaluates a fixed trial radius while the true radius varies;
+    the final amplitude-sensitive stages leave it false so size information remains.
+
     The basin is wider than the waveform basin by roughly the ratio of the envelope
     width to the carrier period -- an empirical factor to be *measured* by
     `misfit.envelope_basin_width`, not the N_c/2 factor v2.0 asserted.  No claim of
@@ -256,6 +262,11 @@ def envelope_misfit(pred: Tensor, obs: Tensor, *, recon: Reconstruction | None =
     r = recon or reconstruction(band, device=pred.device)
     ep, eo = r.envelope(pred), r.envelope(obs)
     eo = eo.expand_as(ep)
+    if scale_invariant:
+        dims = (1, 2, 3)
+        amp = ((ep * eo).sum(dims, keepdim=True)
+               / ep.pow(2).sum(dims, keepdim=True).clamp_min(eps))
+        ep = amp.clamp_min(0.0) * ep
     num = (ep - eo).pow(2).sum(dim=(1, 2, 3))
     den = eo.pow(2).sum(dim=(1, 2, 3)).clamp_min(eps)
     return num / den

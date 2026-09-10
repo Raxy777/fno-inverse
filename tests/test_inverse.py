@@ -29,6 +29,7 @@ from src.geometry.sdf import FAMILIES, Circle, Ellipse, TwoCircle
 from src.inverse import misfit as M
 from src.inverse import timedomain as TD
 from src.solver import harmonic as H
+from src import training
 
 INV = import_module("src.inverse.invert")
 LAMBDA_S = cfg.LAMBDA_S_MIN
@@ -94,6 +95,35 @@ def test_identity_a_holds_numerically():
     # ... and the objective the screen actually uses does see it.
     assert float(TD.envelope_misfit(shifted, g, recon=r)) > 1e-2, (
         "an envelope objective is shift-equivariant, so a delay is visible to it")
+
+
+def test_envelope_scale_invariance_fits_candidate_amplitude():
+    """The screen can ignore a fixed radius mismatch without changing its final stages."""
+    r = TD.reconstruction(cfg.BAND_STAGE1, n_t=128)
+    torch.manual_seed(4)
+    obs = torch.randn(1, 4, 2, r.freqs.numel(), dtype=torch.complex128)
+    pred = 3.7 * obs
+    fixed = float(TD.envelope_misfit(pred, obs, recon=r))
+    fitted = float(TD.envelope_misfit(pred, obs, recon=r, scale_invariant=True))
+    assert fixed > 1.0
+    assert fitted < 1e-20
+    assert float(M.OBJECTIVES["envelope"](
+        pred, obs, band=cfg.BAND_STAGE1, scale_invariant=True)) < 1e-20
+
+
+
+def test_screen_requests_scale_invariance_but_final_complex_objective_does_not():
+    """The deployed screen and final complex stage retain their distinct semantics."""
+    assert INV.screen.__name__ == "screen"
+    assert cfg.SCREEN_OBJECTIVE == "envelope"
+    assert cfg.STAGE_OBJECTIVE[3] == "complex"
+    r = TD.reconstruction(cfg.BAND_STAGE3, n_t=128)
+    obs = torch.ones(1, 2, 2, r.freqs.numel(), dtype=torch.complex128)
+    pred = 2.0 * obs
+    assert float(TD.envelope_misfit(pred, obs, recon=r)) > 0.1
+    assert float(M.complex_misfit(pred, obs)) > 0.1
+
+
 
 
 # ---------------------------------------------------------------------------

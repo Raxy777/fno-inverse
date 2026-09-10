@@ -76,6 +76,10 @@ Downstream: `GATE_REL_L2 = 0.05` and `GATE_ARRIVAL_PERIODS = 0.05` on the surrog
 `GATE_GRAD_SIGFIGS = 3` on autodiff vs FD of the surrogate, `GATE_SENSITIVITY_REL = 0.20`
 and `GATE_SENSITIVITY_COSINE = 0.95` on surrogate vs solver sensitivities,
 `GATE_SOLVER_VERIFY_LS = 0.15` on the recovered geometry re-solved with the FDTD,
+`GATE_SOLVER_VERIFY_RESIDUAL_RATIO = 2.0`, `GATE_SOLVER_VERIFY_AXIS_RATIO = 0.15`,
+`GATE_SOLVER_VERIFY_ORIENTATION_DEG = 10.0` on the shape criteria returned by the solver
+verification (position, residual and shape are reported separately, with `"incomplete"` when
+ground truth is absent),
 `GATE_POSITION_LS = 0.10` and `GATE_IOU = 0.80` per case, `GATE_SUCCESS_RATE = 0.90`
 over cases, `GATE_SCREEN_CAPTURE = 0.90` for the magnitude screen's capture rate, and
 `GATE_LOF_FPR = 0.10` for the lack-of-fit indicator at a threshold frozen before testing.

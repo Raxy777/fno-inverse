@@ -183,3 +183,66 @@ range, worst 17.5% at the top of the band. Checks 4, 5, 8 and 9 did not run — 
    line in `config.py` still quote pre-absorber numbers for that reason.
 6. The two upstream design documents still carry the superseded claims — §5.3–5.4, §6.4,
    §8.3 and §9 — and the corrections have not been propagated back into them.
+
+---
+
+## Second review findings
+
+### F1. Envelope misfit was not scale-invariant — fixed
+
+The stage-1 screen objective was called with `scale_invariant=True` by default but ignored
+the flag. `timedomain.envelope_misfit` was fitting a constant offset but not a multiplicative
+amplitude — a shift of the predicted envelope profile rather than a scaling of it. The
+`scale_invariant=True` parameter now fits a least-squares nonnegative scalar `A` to the
+predicted envelope before comparing:
+
+```
+A = sum(Ep · Eo) / sum(Ep²)
+minimise ||A · Ep − Eo||²
+```
+
+This is the correct form for scale invariance: a pure multiplicative mismatch between the
+two envelopes gives exactly zero error. `misfit._o_envelope` propagates the flag through, and
+`invert.screen_capture_rate` now deploys `scale_invariant=True` on the objective it measures,
+so the coverage statistic reflects what step 1 actually minimises.
+
+### F2. Receiver reduction dimension in notebooks 04 and 05 — fixed
+
+The ring-error computation was reducing `(1, 2, 3, 4)` — over the frequency-folded batch
+dimension `[B, F, C, ny, nx]` — instead of `(1, 2, 3)`. The correct dims are `(1, 2, 3)`,
+which reduce `[B, F, C, ny, nx]` → `[B]` per sample. A shared helper
+`training.per_sample_relative_errors(pred, target, recv)` now computes both the field-space
+and ring-space relative errors in one call, used by the notebooks and available for scripts.
+A regression test covers the shape contract.
+
+### F3. Check 5 moved the source location under grid refinement — fixed
+
+When `refine > 1`, the physical source index `iy` was being refined with `_refine_index`
+instead of `_refine_face_index`. The `+y` vertical force is injected on the `vy` face, not
+at the cell centre, so `iy` carries a half-cell offset that `_refine_face_index` preserves
+but `_refine_index` doubles. The fix uses `_refine_face_index` for `iy` and
+`_refine_index` for `ix` (the `vx` face carries no vertical offset). The gate is unchanged.
+
+### F4. Solver verification had one gate for three independent questions — fixed
+
+`verify_with_solver` returned a single `gate_pass` boolean for all criteria. The function
+now returns:
+
+- `independent_status`: `"pass"` | `"fail"` | `"incomplete"` (incomplete when ground truth
+  is absent, so `gate_pass` is `None` — not `True`)
+- `position_gate_pass`, `residual_gate_pass`, `shape_gate_pass`: three independent booleans
+- `iou`, `axis_ratio_error`, `orientation_error_deg`: shape metrics for the ellipse family
+- `truth_family`: which shape family the truth belongs to
+
+Three new gates in `config.py`:
+
+| Gate | Value | What it gates |
+|---|---|---|
+| `GATE_SOLVER_VERIFY_RESIDUAL_RATIO` | 2.0 | `misfit_solver(theta_hat) / misfit_solver(theta_true) < 2` |
+| `GATE_SOLVER_VERIFY_AXIS_RATIO` | 0.15 | ellipse axis-ratio error |
+| `GATE_SOLVER_VERIFY_ORIENTATION_DEG` | 10.0 | ellipse orientation error (degrees) |
+
+Notebooks 05 and 06 now display `independent_status` (PASS / FAIL / INCOMPLETE) in the
+verification table and use `ver.get("position_gate_pass", False)` in the gates dict and
+checklist. `summarise`'s `"gate_pass"` booleans for success-rate statistics are unchanged —
+those come from a different function with different semantics.

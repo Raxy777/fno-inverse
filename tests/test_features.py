@@ -21,6 +21,7 @@ import torch
 
 from src import config as cfg
 from src import features as feat
+from src import training
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +32,24 @@ def test_complex_channel_round_trip():
     x = feat.complex_to_channels(z)
     assert x.shape == (3, 5, 4, 7, 7)
     assert torch.equal(feat.channels_to_complex(x), z)
+
+
+def test_per_sample_relative_errors_reduce_one_batch_correctly():
+    """Notebook 04's helper must preserve one value per sample, not reduce a missing axis."""
+    pred = torch.arange(2 * 3 * 2 * 4 * 4, dtype=torch.float32).reshape(2, 3, 2, 4, 4)
+    target = pred + 1.0
+    recv = torch.tensor([[0, 0], [1, 2], [3, 3]])
+    field, ring = training.per_sample_relative_errors(pred, target, recv)
+    expected_field = ((pred - target).pow(2).sum((1, 2, 3)).sqrt()
+                      / target.pow(2).sum((1, 2, 3)).sqrt())
+    pr, tr = pred[..., recv[:, 0], recv[:, 1]], target[..., recv[:, 0], recv[:, 1]]
+    expected_ring = ((pr - tr).pow(2).sum((1, 2, 3)).sqrt()
+                     / tr.pow(2).sum((1, 2, 3)).sqrt())
+    assert field.shape == ring.shape == (2,)
+    assert torch.allclose(field, expected_field)
+    assert torch.allclose(ring, expected_ring)
+
+
 
 
 def test_channel_packing_is_interleaved_not_blocked():

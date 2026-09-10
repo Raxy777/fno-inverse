@@ -496,6 +496,9 @@ GATE_PHYS_RESIDUAL_LABEL: float = 0.15     # step 4b: collocated physics residua
 #                                            measured *on reference labels*, relative
 GATE_SOLVER_VERIFY_LS: float = 0.15        # step 10b: position error of the recovered
 #                                            geometry when re-scored by the solver
+GATE_SOLVER_VERIFY_RESIDUAL_RATIO: float = 2.0  # step 10b: solver J(answer)/J(truth)
+GATE_SOLVER_VERIFY_AXIS_RATIO: float = 0.15     # step 10b: ellipse axis-ratio error
+GATE_SOLVER_VERIFY_ORIENTATION_DEG: float = 10.0 # step 10b: ellipse orientation error
 GATE_LOF_FPR: float = 0.10                 # step 12: lack-of-fit false-positive rate
 #                                            at the frozen threshold
 

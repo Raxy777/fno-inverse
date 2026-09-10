@@ -570,10 +570,12 @@ def screen_capture_rate(forward: SurrogateForward, cases: list[InverseCase],
     basin = None
     if capture_ls is None:
         obj = Objective.for_stage(1, forward, truth[0], family,
-                                  eps_cells=cfg.EPS_INTERFACE_CELLS)
+                                  eps_cells=cfg.EPS_INTERFACE_CELLS,
+                                  scale_invariant=True)
         basin = envelope_basin_width(obj)
         capture_ls = 0.5 * min(basin["per_objective"]["envelope"]["along_ls"],
                                basin["per_objective"]["envelope"]["across_ls"])
+
 
     grid = screen_candidates(family, truth[0].lambda_s, n_grid=n_grid)
     out: dict = {}

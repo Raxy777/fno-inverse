@@ -331,7 +331,8 @@ def _o_envelope(pred: Tensor, obs: Tensor, *, band: slice,
                 weights: Tensor | None = None, scale_invariant: bool = False,
                 recon: td.Reconstruction | None = None) -> Tensor:
     _needs_no_weights("envelope", weights)
-    return td.envelope_misfit(pred, obs, recon=recon, band=band)
+    return td.envelope_misfit(pred, obs, recon=recon, band=band,
+                               scale_invariant=scale_invariant)
 
 
 def _o_traveltime(pred: Tensor, obs: Tensor, *, band: slice,

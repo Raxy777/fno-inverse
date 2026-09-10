@@ -65,6 +65,25 @@ def ring_rel_l2(pred: Tensor, target: Tensor, recv: Tensor, *,
             / t.pow(2).sum(dims).sqrt().clamp_min(eps)).mean()
 
 
+def per_sample_relative_errors(pred: Tensor, target: Tensor, recv: Tensor, *,
+                               eps: float = 1e-12) -> tuple[Tensor, Tensor]:
+    """
+    Field and receiver-ring relative L2 for a batch of frequency-folded predictions.
+
+    `pred` and `target` are `[B, F, C, ny, nx]`; the returned tensors are `[B]`.
+    Keeping this reduction here, rather than duplicating it in a notebook, prevents a
+    stale dimension tuple from silently turning a per-sample metric into a scalar.
+    """
+    dims = (1, 2, 3)
+    field = ((pred - target).pow(2).sum(dims).sqrt()
+             / target.pow(2).sum(dims).sqrt().clamp_min(eps))
+    ry, rx = recv[:, 0], recv[:, 1]
+    p_ring, t_ring = pred[..., ry, rx], target[..., ry, rx]
+    ring = ((p_ring - t_ring).pow(2).sum(dims).sqrt()
+            / t_ring.pow(2).sum(dims).sqrt().clamp_min(eps))
+    return field, ring
+
+
 def phase_error_periods(pred: Tensor, target: Tensor, recv: Tensor, *,
                         amp_floor: float = 0.05) -> Tensor:
     """
@@ -303,8 +322,8 @@ def load(path, device=None) -> tuple[FNO2d, dict]:
     return model, ck
 
 
-__all__ = ["EvalResult", "evaluate", "load", "phase_error_periods", "receivers_tensor",
-           "ring_rel_l2", "save", "train"]
+__all__ = ["EvalResult", "evaluate", "load", "per_sample_relative_errors",
+           "phase_error_periods", "receivers_tensor", "ring_rel_l2", "save", "train"]
 
 
 def main() -> None:

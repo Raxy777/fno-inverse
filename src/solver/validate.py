@@ -751,7 +751,9 @@ def check_grid_convergence(nu: float = 1.0 / 3.0, *, device=None,
         assert sim.n_net == cfg.N_NET, f"refine={r} gives n_net={sim.n_net}"
         iy, ix = cfg.net_to_fine(*src_c)                     # production indices
         if r > 1:
-            iy, ix = _refine_index(iy, r), _refine_index(ix, r)
+            # The +y force is injected on the vy face, not at the y-cell centre.
+            # Preserve its physical location exactly under refinement.
+            iy, ix = _refine_face_index(iy, r), _refine_index(ix, r)
         res = sim.run([(iy, ix)], nt=nt, recv_yx=_receiver_ring(sim.n_net))
         return H.displacement_from_ascans(res.ascans, omegas=om, dt=dt, nt=nt)
 
