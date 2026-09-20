@@ -430,7 +430,10 @@ def balance_alpha(l_data: Tensor, l_phys: Tensor, params: list[Tensor], *,
     def gnorm(loss: Tensor) -> float:
         g = torch.autograd.grad(loss, params, retain_graph=True,
                                 allow_unused=True, create_graph=False)
-        return math.sqrt(sum(float(x.pow(2).sum()) for x in g if x is not None))
+        # |x|**2, not x**2: gradients w.r.t. the spectral weights are complex, and
+        # float(complex_tensor) raises "cannot be converted to double without
+        # overflow".  abs().pow(2) is the right L2 summand and a no-op for real x.
+        return math.sqrt(sum(float(x.abs().pow(2).sum()) for x in g if x is not None))
 
     gd, gp = gnorm(l_data), gnorm(l_phys)
     if gp <= 0.0 or not math.isfinite(gp):

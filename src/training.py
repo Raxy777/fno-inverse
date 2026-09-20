@@ -244,15 +244,18 @@ def train(model: FNO2d, train_path: str, val_path: str, *, out_dir: str,
             sched.step()
 
             b = x.shape[0]
+            # detach: these are logging accumulators, and terms.total still carries
+            # the retained graph on balance steps -- float() on a requires_grad tensor
+            # warns and pins the graph alive one iteration longer than intended.
             for k in ("total", "field", "h1", "meas", "phys"):
-                run[k] += float(getattr(terms, k)) * b
+                run[k] += float(getattr(terms, k).detach()) * b
             run["n"] += b
             step += 1
             if log_every and step % log_every == 0:
                 print(f"  ep {ep:3d} step {step:6d}  "
-                      f"loss {float(terms.total):.4f}  "
-                      f"field {float(terms.field):.4f}  "
-                      f"phys {float(terms.phys):.4f}  alpha {terms.alpha:.2e}")
+                      f"loss {float(terms.total.detach()):.4f}  "
+                      f"field {float(terms.field.detach()):.4f}  "
+                      f"phys {float(terms.phys.detach()):.4f}  alpha {terms.alpha:.2e}")
 
         n = max(run.pop("n"), 1)
         row = {k: v / n for k, v in run.items()}

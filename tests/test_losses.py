@@ -930,3 +930,26 @@ def test_balance_alpha_on_the_real_projection_layer():
     a = losses.balance_alpha(lt.field, lt.phys, params, target_ratio=0.1)
     assert 1e-5 <= a <= 1.0
     assert math.isfinite(a)
+
+
+def test_balance_alpha_on_all_parameters_including_complex_spectral_weights():
+    """
+    Passing the whole model -- not just the projection head -- must not raise.  The
+    spectral weights are complex64, and a norm summand of `x.pow(2)` (rather than
+    `x.abs().pow(2)`) leaves a complex scalar whose `float()` raises "value cannot be
+    converted to type double without overflow".  The master notebook's stage-C
+    diagnostic makes exactly this call to compare the ratio against the head.
+    """
+    from src import models
+
+    pred, target, u_inc, ctx, recv = _compute_batch()
+    net = models.build("tiny", d_v=8, kmax=6)
+    x = torch.randn(pred.shape[0], cfg.C_IN, cfg.N_NET, cfg.N_NET)
+    out = net(x)
+    lt = losses.compute(out, target, recv_yx=recv, ctx=ctx, u_inc=u_inc, alpha=0.1)
+    params = [p for p in net.parameters() if p.requires_grad]
+    assert any(p.is_complex() for p in params), "test is meaningless without them"
+
+    a = losses.balance_alpha(lt.field, lt.phys, params, target_ratio=0.1)
+    assert 1e-5 <= a <= 1.0
+    assert math.isfinite(a)
