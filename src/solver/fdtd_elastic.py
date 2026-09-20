@@ -300,7 +300,14 @@ class ElasticFDTD2D:
         self.courant = courant
 
         # -- moduli at their own staggered positions (§3.1) ----------------
-        floor = cfg.VOID_STIFFNESS_FLOOR * float(mu.max())
+        # Batch-independent guard (see cfg.MU_HARMONIC_FLOOR).  The old code used
+        # VOID_STIFFNESS_FLOOR * mu.max() over the batch, so the same sample got
+        # a different mu_xy depending on its batch mates: in a mixed-nu batch the
+        # floor (≈3.3e-05) exceeded the void mu of low-mu samples (≈2.1e-05) and
+        # raised it by ~60%, changing the scattered field by up to 0.36 rel-L2
+        # while same-floor batches reproduced bitwise (median 0, bimodal).  The
+        # guard must be absolute and far below any physical mu.
+        floor = cfg.MU_HARMONIC_FLOOR
         self.lam = lam
         self.mu = mu
         self.c11 = lam + 2.0 * mu                       # centres

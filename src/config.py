@@ -334,6 +334,16 @@ EPS_INVERT_END: float = 0.125
 VOID_DENSITY_SCALE: float = 1.0e-2     # relative density retained inside the void
 VOID_STIFFNESS_FLOOR: float = 1.0e-4   # relative floor, keeps the update finite
 
+# Harmonic-average guard for mu at corners (`solver/fdtd_elastic.py`).
+# Absolute, tiny, and batch-independent: it exists only to avoid 0/0 if a zero
+# modulus is ever passed in.  `material_fields` already guarantees
+# mu >= min(mu0)*VOID_STIFFNESS_FLOOR ~ 2e-05, so 1e-12 is ~7 orders below any
+# real value and never alters physics.  It must NOT be derived from
+# `mu.max()` over the batch: that made the same physical sample solve
+# differently depending on its batch mates (up to 0.36 rel-L2 on the scattered
+# field, median 0 / bimodal), which is what §11.2 step 6 caught.
+MU_HARMONIC_FLOOR: float = 1.0e-12
+
 # ---------------------------------------------------------------------------
 # Source / receiver ring (§3.7)
 # ---------------------------------------------------------------------------
