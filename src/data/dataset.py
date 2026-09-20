@@ -175,11 +175,38 @@ class WaveDataset(Dataset):
         return out
 
 
+def _worker_start_method() -> str | None:
+    """
+    'forkserver' when workers are used on a fork-capable platform, else None.
+
+    persistent_workers is off (see `WaveDataset.set_epoch`), so a fresh set of
+    workers is forked every epoch.  The default `fork` start method forks the whole
+    training process -- including whatever threads CUDA, the pin-memory copier and
+    HDF5's global mutex are running -- and if a lock is held at the instant of the
+    fork the child inherits it locked, owned by a thread that does not exist in the
+    child, and deadlocks on its first HDF5 read.  It is intermittent by construction:
+    it struck this run at epoch 88, having survived 87 forks.  `forkserver` forks
+    each worker from a pristine single-threaded server process instead, so no
+    application lock can be held across the fork.  The dataset is already pickled
+    into workers (`__getstate__` drops the h5py handle), so nothing else changes --
+    including the per-epoch reseed, which still rides the freshly pickled `self.epoch`.
+    """
+    import multiprocessing as mp
+    methods = mp.get_all_start_methods()
+    if "forkserver" in methods:
+        return "forkserver"
+    if "fork" in methods:
+        return "fork"
+    return None                                    # Windows/spawn-only: DataLoader default
+
+
 def make_loader(dataset: WaveDataset, *, batch_size: int = cfg.BATCH_SIZE,
                 shuffle: bool | None = None, num_workers: int = 4,
                 pin_memory: bool = True) -> DataLoader:
     """
-    persistent_workers is deliberately off; see `WaveDataset.set_epoch`.
+    persistent_workers is deliberately off; see `WaveDataset.set_epoch`.  Because
+    that re-forks every epoch, the multiprocessing start method is pinned to
+    'forkserver' when workers are used; see `_worker_start_method`.
 
     num_workers=4 rather than more because each worker holds its own HDF5 read
     buffer and the bottleneck here is chunk decompression of 128^2 complex planes,
@@ -187,9 +214,13 @@ def make_loader(dataset: WaveDataset, *, batch_size: int = cfg.BATCH_SIZE,
     """
     if shuffle is None:
         shuffle = dataset.train
+    # A start method may only be passed when workers are actually spawned; with
+    # num_workers=0 the loader runs in-process and DataLoader rejects the argument.
+    ctx = _worker_start_method() if num_workers > 0 else None
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers, pin_memory=pin_memory,
-                      drop_last=dataset.train, persistent_workers=False)
+                      drop_last=dataset.train, persistent_workers=False,
+                      multiprocessing_context=ctx)
 
 
 def to_device(batch: dict, device) -> dict:
