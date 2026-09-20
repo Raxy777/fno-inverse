@@ -592,8 +592,8 @@ def check_absorber(nu: float = 1.0 / 3.0, *, device=None,
 # ---------------------------------------------------------------------------
 def check_rayleigh_and_mode_conversion(
         nu: float = 1.0 / 3.0, *, device=None,
-        radii_ls: tuple[float, ...] = (0.10, 0.125, 0.15, 0.20),
-        refine: int = 4, l_domain: float = 3.0,
+        radii_ls: tuple[float, ...] = (0.05, 0.06, 0.07, 0.08),
+        refine: int = 8, l_domain: float = 3.0,
         slope_window: tuple[float, float] = (3.3, 4.7)) -> CheckResult:
     """
     Scattered energy versus void radius, in the long-wavelength limit.
@@ -605,18 +605,23 @@ def check_rayleigh_and_mode_conversion(
 
     Why the gate is a window and not a tight number.  The check needs kR << 1 and
     R >> dx simultaneously, and a fixed grid cannot give both: at the production
-    resolution the smallest resolvable void already has kR ~ 1.  Even on this
-    4x-refined grid the radii used span kR ~ 0.6 to 1.3, where the next term in the
-    long-wavelength expansion contributes tens of percent.  So this is a
-    *scaling-consistency* test rather than a precision test -- it catches a slope of
-    2 or 6, which is what broken interface averaging or a mis-normalised soft
-    indicator produces, and it is not sensitive enough to certify the coefficient.
-    Said plainly rather than dressed up.
+    resolution the smallest resolvable void already has kR ~ 1.  The radii and the
+    refinement therefore move together -- on this 8x-refined grid the radii used
+    span kR ~ 0.31 to 0.50, small enough that the fitted slope recovers to ~3.7
+    while the smallest void is still ~6.4 fine cells across.  (An earlier
+    4x/kR~0.6-1.3 choice sat too far out of the long-wavelength limit: the R^4 law
+    had already begun to saturate, and even the best-conditioned pair fitted below
+    3.3.  The failure was in the sampling, not the solver -- checks 6 and 7 certify
+    the scattered amplitude against analytic references with no fitted parameters.)
+    Even so this is a *scaling-consistency* test rather than a precision test -- it
+    catches a slope of 2 or 6, which is what broken interface averaging or a
+    mis-normalised soft indicator produces, and it is not sensitive enough to
+    certify the coefficient.  Said plainly rather than dressed up.
 
     The interface width is 1 cell of *this* grid rather than the production
     EPS_LEN_PHYS.  Legitimate here because the quantity under test is the solver's
     scattering law, not the dataset's geometry convention, and necessary because
-    these radii are 0.10-0.20 lambda_s -- a quarter of the smallest production void
+    these radii are 0.05-0.08 lambda_s -- an eighth of the smallest production void
     -- so any fixed physical width would be a sizeable fraction of the void itself.
 
     All radii plus the incident field run as one batch, so this is one solve.
