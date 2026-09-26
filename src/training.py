@@ -176,11 +176,22 @@ def train(model: FNO2d, train_path: str, val_path: str, *, out_dir: str,
           gamma: float = cfg.GAMMA_H1, beta: float = cfg.BETA_MEAS,
           alpha: float | None = cfg.ALPHA_PHYS, balance_every: int = 200,
           n_meas: int = 8, num_workers: int = 4, seed: int = cfg.SEED,
-          log_every: int = 50, progress=None) -> dict:
+          log_every: int = 50, progress=None, resume_from: str | None = None) -> dict:
     """
     Train and checkpoint.  `alpha=None` disables the physics term entirely, which is
     the ablation §11.2 step 8 asks for -- the same code path, one flag, so the two
     arms of the ablation cannot differ in anything else.
+
+    `resume_from` warm-starts from a checkpoint written by `save`, and it is a
+    *warm-start*, not a bit-exact resume, on purpose: the checkpoint carries the
+    weights and the balanced `alpha` but not AdamW's moment estimates, the scheduler
+    position, or the RNG -- §7.5 treats the cosine schedule as part of the method, so
+    there was never a state to save.  What continues: the loop picks up at the
+    checkpoint's `epoch + 1`, `history.json` in `out_dir` is extended rather than
+    overwritten (so the curves and the best-so-far survive), and a fresh cosine runs
+    from the last logged LR down to `lr_final` over the remaining epochs.  What
+    restarts from zero: Adam's momentum.  Use it to rescue a run that died mid-way,
+    not to reproduce one.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out = Path(out_dir)
@@ -191,24 +202,52 @@ def train(model: FNO2d, train_path: str, val_path: str, *, out_dir: str,
     va = WaveDataset(val_path, train=False, seed=seed)
     tl = make_loader(tr, batch_size=batch_size, num_workers=num_workers)
     vl = make_loader(va, batch_size=max(1, batch_size // 4), shuffle=False,
-                     num_workers=max(1, num_workers // 2))
+                     num_workers=num_workers // 2)     # 0 stays 0 (in-process)
 
     model = model.to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    hist: dict = dict(train=[], val=[], alpha=[], lr=[], config=config_snapshot())
+    best = math.inf
+    start_epoch = 0
+    lr_start = lr
+    if resume_from is not None:
+        ck = torch.load(resume_from, map_location=device, weights_only=False)
+        model.load_state_dict(ck["state_dict"])
+        start_epoch = int(ck.get("epoch", -1)) + 1
+        if alpha is not None and ck.get("alpha") is not None:
+            alpha = float(ck["alpha"])                 # continue the balanced value
+        hp = out / "history.json"
+        if hp.exists():
+            hist = json.loads(hp.read_text())
+            for k in ("train", "val", "alpha", "lr"):
+                hist.setdefault(k, [])
+            if hist["val"]:
+                best = min(r["rel_l2"] for r in hist["val"])   # don't clobber best.pt
+            if hist["lr"]:
+                lr_start = float(hist["lr"][-1])         # fresh cosine from where LR was
+        if start_epoch >= epochs:
+            raise ValueError(
+                f"resume_from is at epoch {start_epoch} but epochs={epochs}; "
+                f"nothing to train -- raise epochs")
+        print(f"warm-start from {resume_from}: resuming at epoch {start_epoch}/{epochs}, "
+              f"alpha {alpha}, lr {lr_start:.2e}, best-so-far rel-L2 {best:.4f}")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr_start, weight_decay=weight_decay)
+    # A fresh cosine over the *remaining* epochs (lr_start -> lr_final).  Adam's
+    # moments restart regardless; see the resume note in the docstring.
+    remaining = max(1, (epochs - start_epoch) * max(1, len(tl)))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=epochs * max(1, len(tl)), eta_min=lr_final)
+        opt, T_max=remaining, eta_min=lr_final)
     recv = receivers_tensor(device)
     gen = torch.Generator().manual_seed(seed)
     # the two 1x1 convolutions of the projection head: the last point where the data
     # and physics gradients are still the same kind of quantity (see balance_alpha)
     balance_params = [p for p in model.project.parameters() if p.requires_grad]
 
-    hist: dict = dict(train=[], val=[], alpha=[], lr=[], config=config_snapshot())
-    best = math.inf
-    step = 0
+    step = start_epoch * max(1, len(tl))
     t0 = time.perf_counter()
 
-    for ep in range(epochs):
+    for ep in range(start_epoch, epochs):
         model.train()
         tr.set_epoch(ep)
         run = dict(total=0.0, field=0.0, h1=0.0, meas=0.0, phys=0.0, n=0)
@@ -340,6 +379,8 @@ def main() -> None:
     ap.add_argument("--no-physics", action="store_true",
                     help="ablation: drop L_phys (§11.2 step 8)")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--resume", default=None,
+                    help="warm-start from this checkpoint (e.g. .../last.pt)")
     a = ap.parse_args()
 
     model = build(a.variant)
@@ -350,7 +391,7 @@ def main() -> None:
         prog = None
     train(model, f"{a.data}/train.h5", f"{a.data}/val.h5", out_dir=a.out,
           epochs=a.epochs, alpha=None if a.no_physics else cfg.ALPHA_PHYS,
-          num_workers=a.workers, progress=prog)
+          num_workers=a.workers, progress=prog, resume_from=a.resume)
 
 
 if __name__ == "__main__":
